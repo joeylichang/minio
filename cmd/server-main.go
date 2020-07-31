@@ -116,6 +116,53 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 	if len(endpoints) > 0 {
 		globalEndpoints, globalErasureSetDriveCount, setupType, err = createServerEndpoints(globalCLIContext.Addr, endpoints...)
 	} else {
+		/*
+		 * 参数输入约束：
+		 * 	1. 要么所有的参数（按空格划分参数）都没有 {...}，要么每一个都得有 {...}
+		 * 	2. 内部创建 endpoints（host:dir） 是会要求所有的 endpoint 类型相同，否则启动失败
+		 * 		2.1 内部调用 HasEllipses 会一次性校验全部的参数，如果多个参数中，有的有 {...}，有的没有，会按没有处理，那么参数的类型（path or url）将不同，启动失败
+		 * 	3. 带有 {...} 时，一个参数视为一个 zone（应该是专门用于扩展集群时的使用模式）
+		 * 		3.1 所有的 zone，根据参数计算的 EC 编码块数 和 启动模式（单机、EC、DisEC）必须相同
+		 * 		3.2 如果是以 {...} 方式启动的 DisEC 模式集群
+		 * 			3.2.1 要求节点必须是同构的
+		 * 			3.2.2 扩容时必须也用 {...} 启动，则新加入的节点必须也是同构的
+		 * 			3.2.3 但是扩容的节点和元节点可以不同构，只要经过同样的计算逻辑保证 EC 编码块数 和 启动模式 相同即可
+		 * 		3.3 如果是以单个目录展开的方式启动的 DisEC 模式集群
+		 * 			3.3.1 所有的节点在一个 zone 中，不能进行集群模式扩容（悬疑，带后面解决，因为如果是hash算法的话，取模的总数变了） 
+		 * 
+		 * 结论：
+		 * 	1. zone 的方式可扩展，如果使用的话，要求机器必须同构（磁盘）
+		 * 	2. 跨 zone 不需要机器同构，但是需要新的zone 的参数经过计算之后有相同的 EC 编码分块数量，对于新加机器也是有一定要求的
+		 * 
+		 * 参数解析逻辑：
+		 * 	1. 带有 {...} 参数的解析流程（createServerEndpoints）
+		 * 		1.1 内部循环所有的输入参数，既每个 zone 的参数
+		 * 		1.2 循环内调用 GetAllSets ，完成 EC 编码分块数量的计算，以及 <host, dir> 的分组（分几组，每组内部的路径是什么）
+		 * 			1.2.1 totalSizes = host_num * dir_num,
+		 * 			1.2.2 求 totalSizes 的最大公约数 commonSize，计算备选集 setCounts = 预值EC编码分块数量（[4, 16]）能被 commonSize 整除的集合
+		 * 					如果环境变量设置了 EC 编码的分块数量，此时必须在 setCounts 中，否则启动失败
+		 * 			1.2.3 如果 dir 使用了 {...}， 则从 setCounts 中选出整除或者被整除 dir_num 的备选集 setCounts2
+		 * 				  如果 dir 没有使用 {...}，则只有 host 使用 {...} ，则从 setCounts 中选出整除或者被整除 host_num 的备选集 setCounts2
+		 * 				  如果 dir 和 host 都使用了 {...}，则用 dir_num
+		 * 				注意：核心保证 EC 的数据块在 磁盘上是均匀分布的
+		 * 			1.2.4 globalErasureSetDriveCount = max{setCounts2}
+		 * 			1.2.5 对 <host, dir> 进行分组，根据 EC 编码的分块数量，先遍历 host，在遍历 dir 完成分组
+		 * 		1.3 循环内调用 CreateEndpoints，对 GetAllSets 生成的结果进行处理，然后生成启动模式（FSSetupType、ErasureSetupType、DistErasureSetupType）
+		 * 			1.3.1 根据 1.2 中生成的分组初始化 endpointlist，对其进行一些约束检查（类型是否一致、checkCrossDeviceMounts等），否则返回err
+		 * 			1.3.2 setupType 选择
+		 * 				1.3.2.1 FSSetupType：host 和 dir 都只有一个
+		 * 				1.3.2.2 ErasureSetupType：参数中没有host，只有dir，且多余一个
+		 * 				1.3.2.3 DistErasureSetupType
+		 * 					a. 参数生成的 endpoints 都是 url 类型
+		 * 					b. 同一个dir，没有被同一个host  不同的 port 使用，既 dir 不能夸进程共享
+		 * 					c. 可能出现，所有的 endpoints 都是本机的url 类型，此时由于使用了 url 算作是 DistErasureSetupType 
+		 * 		1.4 循环内会判断前后两个 zone 参数生成的 EC 编码分块数量 和 SetupType 是否相同，否则返回 error
+		 * 		1.5 循环内将生成的 <host, dir> 的分组，既 endpointList 加入 endpointZones。
+		 * 		1.6 循环外返回， endpointZones，EC 编码分块数，SetupType
+		 * 	2. 不带有 {...} 参数的解析流程
+		 *		2.1 主要流程与上面完全一致，至少少了 {...} 的解析
+		 * 		2.2 totalSizes = len(args)
+		 */
 		globalEndpoints, globalErasureSetDriveCount, setupType, err = createServerEndpoints(globalCLIContext.Addr, ctx.Args()...)
 	}
 	logger.FatalIf(err, "Invalid command line arguments")

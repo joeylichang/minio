@@ -92,6 +92,9 @@ func possibleSetCountsWithSymmetry(setCounts []uint64, argPatterns []ellipses.Ar
 	var newSetCounts = make(map[uint64]struct{})
 	for _, ss := range setCounts {
 		var symmetry bool
+		/*
+		 * 1. 保证 EC 的数据块 在磁盘上是均匀分布的
+		 */
 		for _, argPattern := range argPatterns {
 			for _, p := range argPattern {
 				if uint64(len(p.Seq)) > ss {
@@ -137,12 +140,18 @@ func getSetIndexes(args []string, totalSizes []uint64, customSetDriveCount uint6
 	setIndexes = make([][]uint64, len(totalSizes))
 	for _, totalSize := range totalSizes {
 		// Check if totalSize has minimum range upto setSize
+		/*
+		 * 支持的EC 编码分块数量 [4, 16]
+		 */
 		if totalSize < setSizes[0] || totalSize < customSetDriveCount {
 			msg := fmt.Sprintf("Incorrect number of endpoints provided %s", args)
 			return nil, config.ErrInvalidNumberOfErasureEndpoints(nil).Msg(msg)
 		}
 	}
 
+	/*
+	 * 求最大公约数
+	 */
 	commonSize := getDivisibleSize(totalSizes)
 	possibleSetCounts := func(setSize uint64) (ss []uint64) {
 		for _, s := range setSizes {
@@ -153,6 +162,9 @@ func getSetIndexes(args []string, totalSizes []uint64, customSetDriveCount uint6
 		return ss
 	}
 
+	/*
+	 * 最大公约数之内可以整除 分块数量预置集合（[4, 16]） 的数集合
+	 */
 	setCounts := possibleSetCounts(commonSize)
 	if len(setCounts) == 0 {
 		msg := fmt.Sprintf("Incorrect number of endpoints provided %s, number of disks %d is not divisible by any supported erasure set sizes %d", args, commonSize, setSizes)
@@ -179,6 +191,10 @@ func getSetIndexes(args []string, totalSizes []uint64, customSetDriveCount uint6
 		globalCustomErasureDriveCount = true
 	} else {
 		// Returns possible set counts with symmetry.
+		/*
+		 * setCounts 中的备选集要被 host_num 或者 dir_num 数目都能整除或者被整除，从小到大排序
+		 * 筛选出这样的数字集合，重新赋值给 setCounts
+		 */
 		setCounts = possibleSetCountsWithSymmetry(setCounts, argPatterns)
 
 		if len(setCounts) == 0 {
@@ -187,10 +203,16 @@ func getSetIndexes(args []string, totalSizes []uint64, customSetDriveCount uint6
 		}
 
 		// Final set size with all the symmetry accounted for.
+		/*
+		 * 选出备选集中最大的那个
+		 */
 		setSize = commonSetDriveCount(commonSize, setCounts)
 	}
 
 	// Check whether setSize is with the supported range.
+	/*
+	 * 是否在预置的备选集中 [4, 16]
+	 */
 	if !isValidSetSize(setSize) {
 		msg := fmt.Sprintf("Incorrect number of endpoints provided %s, number of disks %d is not divisible by any supported erasure set sizes %d", args, commonSize, setSizes)
 		return nil, config.ErrInvalidNumberOfErasureEndpoints(nil).Msg(msg)
@@ -198,6 +220,10 @@ func getSetIndexes(args []string, totalSizes []uint64, customSetDriveCount uint6
 
 	for i := range totalSizes {
 		for j := uint64(0); j < totalSizes[i]/setSize; j++ {
+			/*
+			 * 一维：分几组
+			 * 二维：每组几个EC分块
+			 */
 			setIndexes[i] = append(setIndexes[i], setSize)
 		}
 	}
@@ -224,6 +250,9 @@ func (s endpointSet) getEndpoints() (endpoints []string) {
 // be the right set size etc.
 func (s endpointSet) Get() (sets [][]string) {
 	var k = uint64(0)
+	/*
+	 * 先遍历节点，再遍历目录，组成一个数组，然后根据 setIndexes 进行截取生成最终的 分组
+	 */
 	endpoints := s.getEndpoints()
 	for i := range s.setIndexes {
 		for j := range s.setIndexes[i] {
@@ -254,6 +283,19 @@ func getTotalSizes(argPatterns []ellipses.ArgPattern) []uint64 {
 func parseEndpointSet(customSetDriveCount uint64, args ...string) (ep endpointSet, err error) {
 	var argPatterns = make([]ellipses.ArgPattern, len(args))
 	for i, arg := range args {
+		/*
+		 * FindEllipsesPatterns, 将 host 和 目录差分开
+		 * eg:
+		 * 	input : "/export{1...10}/disk{1...10}"
+		 * 	output: 拆分成两段， 	/export{1...10}/disk 和 {1...10}
+		 * 			{1...10} 代表目录
+		 * 			/export{1...10}/disk 代表host ，前缀是 /export、后缀是 /disk 
+		 * type Pattern struct {
+	 	 *		Prefix string
+	     *		Suffix string
+	 	 *		Seq    []string
+	 	 * }
+		 */
 		patterns, perr := ellipses.FindEllipsesPatterns(arg)
 		if perr != nil {
 			return endpointSet{}, config.ErrInvalidErasureEndpoints(nil).Msg(perr.Error())
@@ -261,13 +303,16 @@ func parseEndpointSet(customSetDriveCount uint64, args ...string) (ep endpointSe
 		argPatterns[i] = patterns
 	}
 
+	/*
+	 * getTotalSizes = host_num * dir_num，每个参数计算一个数值加入一个数组，例如 多台机器上面的目录不同构的时候会出现
+	 * 计算 EC 编码 和 目录分组的核心逻辑
+	 */
 	ep.setIndexes, err = getSetIndexes(args, getTotalSizes(argPatterns), customSetDriveCount, argPatterns)
 	if err != nil {
 		return endpointSet{}, config.ErrInvalidErasureEndpoints(nil).Msg(err.Error())
 	}
 
 	ep.argPatterns = argPatterns
-
 	return ep, nil
 }
 
@@ -297,11 +342,18 @@ func GetAllSets(customSetDriveCount uint64, args ...string) ([][]string, error) 
 		}
 		setArgs = s.Get()
 	} else {
+		/*
+		 * 1. 对 {...} 进行解析，解析为前缀、后缀、seq
+		 * 2. 调用 getSetIndexes 完成，EC 编码分块数量 和 分组的计算
+		 */
 		s, err := parseEndpointSet(customSetDriveCount, args...)
 		if err != nil {
 			return nil, err
 		}
-		setArgs = s.Get()
+		/*
+		 * 根据计算的EC 分块数量，对Host:Dir 进行分组
+		 */
+		setArgs = s.Get()		
 	}
 
 	uniqueArgs := set.NewStringSet()
@@ -336,6 +388,9 @@ func createServerEndpoints(serverAddr string, args ...string) (
 		return nil, -1, -1, errInvalidArgument
 	}
 
+	/*
+	 * 从环境变量中获取EC编码的分块数量，如果没有则为0，在后面根据参数进行自动适配
+	 */
 	if v := env.Get(EnvErasureSetDriveCount, ""); v != "" {
 		setDriveCount, err = strconv.Atoi(v)
 		if err != nil {
@@ -364,11 +419,29 @@ func createServerEndpoints(serverAddr string, args ...string) (
 	var prevSetupType SetupType
 	var foundPrevLocal bool
 	for _, arg := range args {
+		/*
+		 * 返回的 setArgs 记录了分好组的目录结构
+		 * eg：
+		 * 	in: "/export{1...64}"
+		 * 	out: [/export1, ... , /export16][/export17, ... , /export32][/export33, ……, /export48][/export49, ……, /export64]
+		 * 但是，setDriveCount 仍然是0，但是其内部已经判断是 16 了，且分为 4 组
+		 */
 		setArgs, err := GetAllSets(uint64(setDriveCount), arg)
 		if err != nil {
 			return nil, -1, -1, err
 		}
 		var endpointList Endpoints
+		/*
+		 * setupType:
+		 * 	1. FSSetupType => len(args) == 1 && len(args[0]) == 1
+		 * 	2. ErasureSetupType => endpoints[0].Type() == PathEndpointType
+		 * 	3. DistErasureSetupType =>
+		 * 		3.1 URL style
+		 * 		3.2 same path is not used in endpoints of a host on different port
+		 * 		3.3 same path is used for more than 1 local endpoints
+		 * 		3.4 If all endpoints have same port number, Just treat it as distErasure setup
+		 * 		3.5 Error out if we have less than 2 unique servers.
+		 */
 		endpointList, setupType, err = CreateEndpoints(serverAddr, foundPrevLocal, setArgs...)
 		if err != nil {
 			return nil, -1, -1, err
@@ -387,6 +460,10 @@ func createServerEndpoints(serverAddr string, args ...string) (
 			return nil, -1, -1, err
 		}
 		foundPrevLocal = endpointList.atleastOneEndpointLocal()
+		/*
+		 * 在这里进行了 EC 编码分块数量的赋值（环境变量没有指定的情况下）
+		 * 具体逻辑在 GetAllSets 内部完成
+		 */
 		if setDriveCount == 0 {
 			setDriveCount = len(setArgs[0])
 		}

@@ -195,9 +195,9 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 // ZoneEndpoints represent endpoints in a given zone
 // along with its setCount and drivesPerSet.
 type ZoneEndpoints struct {
-	SetCount     int
-	DrivesPerSet int
-	Endpoints    Endpoints
+	SetCount     int 		// 所有的目录分成几组
+	DrivesPerSet int 		// 纠删码的分块数量，既一组分成几块
+	Endpoints    Endpoints 	// 所有的目录
 }
 
 // EndpointZones - list of list of endpoints
@@ -542,12 +542,10 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		if err != nil {
 			return endpoints, setupType, config.ErrInvalidErasureEndpoints(nil).Msg(err.Error())
 		}
-
 		// Check for cross device mounts if any.
 		if err = checkCrossDeviceMounts(eps); err != nil {
 			return endpoints, setupType, config.ErrInvalidErasureEndpoints(nil).Msg(err.Error())
 		}
-
 		endpoints = append(endpoints, eps...)
 	}
 
