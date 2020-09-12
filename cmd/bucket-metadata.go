@@ -61,10 +61,10 @@ var (
 // bucketMetadataFormat refers to the format.
 // bucketMetadataVersion can be used to track a rolling upgrade of a field.
 type BucketMetadata struct {
-	Name                    string
-	Created                 time.Time
+	Name                    string 				// Bucket Name
+	Created                 time.Time 			// 创建时间
 	LockEnabled             bool // legacy not used anymore.
-	PolicyConfigJSON        []byte
+	PolicyConfigJSON        []byte 				/* []byte 与下面的配置一一对应，下面应该是落盘的 */ 
 	NotificationConfigXML   []byte
 	LifecycleConfigXML      []byte
 	ObjectLockConfigXML     []byte
@@ -76,16 +76,16 @@ type BucketMetadata struct {
 	BucketTargetsConfigJSON []byte
 
 	// Unexported fields. Must be updated atomically.
-	policyConfig       *policy.Policy
-	notificationConfig *event.Config
-	lifecycleConfig    *lifecycle.Lifecycle
-	objectLockConfig   *objectlock.Config
-	versioningConfig   *versioning.Versioning
-	sseConfig          *bucketsse.BucketSSEConfig
-	taggingConfig      *tags.Tags
-	quotaConfig        *madmin.BucketQuota
-	replicationConfig  *replication.Config
-	bucketTargetConfig *madmin.BucketTarget
+	policyConfig       *policy.Policy 				// PolicyConfigJSON
+	notificationConfig *event.Config 				// NotificationConfigXML
+	lifecycleConfig    *lifecycle.Lifecycle 		// LifecycleConfigXML
+	objectLockConfig   *objectlock.Config 			// ObjectLockConfigXML
+	versioningConfig   *versioning.Versioning 		// VersioningConfigXML
+	sseConfig          *bucketsse.BucketSSEConfig 	// EncryptionConfigXML
+	taggingConfig      *tags.Tags 					// TaggingConfigXML
+	quotaConfig        *madmin.BucketQuota 			// QuotaConfigJSON
+	replicationConfig  *replication.Config 			// ReplicationConfigXML
+	bucketTargetConfig *madmin.BucketTarget 		// BucketTargetsConfigJSON
 }
 
 // newBucketMetadata creates BucketMetadata with the supplied name and Created to Now.

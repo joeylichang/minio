@@ -35,6 +35,12 @@ import (
 	"github.com/minio/minio/pkg/sync/errgroup"
 )
 
+/*
+ * Bucket -> BucketMetadata 的映射
+ * BucketMetadata 内部分很多类配置，每一类配置分位内存 和 落盘的部分
+ * BucketMetadata -> all kinds config(memory and disk)
+ */
+
 // BucketMetadataSys captures all bucket metadata for a given cluster.
 type BucketMetadataSys struct {
 	sync.RWMutex

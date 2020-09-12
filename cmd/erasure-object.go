@@ -32,6 +32,17 @@ import (
 	"github.com/minio/minio/pkg/sync/errgroup"
 )
 
+
+/*
+ * 注意：所有的Get、Put、Delet 都是针对版本的
+ * /DiskPath/Bucket/Object 下面的目录都是不同版本号的数据
+ * /DiskPath/Bucket/Object 下面的 xl.meta 是记录所有的版本的数据的元数据
+ *
+ * Put 每次都会自动生成 versionID
+ * Get 不指定 versionID，读最新的
+ * Delete 不指定 versionID，生成一个 versionID，追加到 xl.Meta 中不删除数据（既必须制定 versionID 才能删除）
+ */
+
 // list all errors which can be ignored in object operations.
 var objectOpIgnoredErrs = append(baseIgnoredErrs, errDiskAccessDenied, errUnformattedDisk)
 
@@ -64,6 +75,11 @@ func (er erasureObjects) putObjectDir(ctx context.Context, bucket, object string
 // CopyObject - copy object source object to destination object.
 // if source object and destination object are same we only
 // update metadata.
+/*
+ * src xl.meta copy tmp, rename tmp to dst
+ * 但是仅仅copy 了 xl.meta，并没有 copy 元数据，更没有删除 src 的数据和元数据
+ * 应该是上层还有其他逻辑
+ */
 func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (oi ObjectInfo, e error) {
 	// This call shouldn't be used for anything other than metadata updates.
 	if !srcInfo.metadataOnly {
@@ -123,6 +139,9 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 
 // GetObjectNInfo - returns object info and an object
 // Read(Closer). When err != nil, the returned reader is always nil.
+/*
+ * 获取数据 和 元数据
+ */
 func (er erasureObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error) {
 	if err = checkGetObjArgs(ctx, bucket, object); err != nil {
 		return nil, err
@@ -207,6 +226,14 @@ func (er erasureObjects) GetObject(ctx context.Context, bucket, object string, s
 	return er.getObject(ctx, bucket, object, startOffset, length, writer, etag, opts)
 }
 
+/*
+ * 读取数据的核心逻辑
+ * 1. 获取读数据需要的 part，计算方式就是 part 是连续存储的，通过 startoffset 找到 part 的 index 和 其上的offset
+ * 	注意：这块要看一下 EC RS 的编码方式，以及实现的方式
+ * 		 上述这种方式主要是兼容mutilpart，对于正常对象，只有 part.1
+ * 2. 循环从part 读取数据，直到指定长度，没读取一个 part 的数据进行一次 解码
+ * 3. 如果解码错误，会进入 deepheal 模块进行修复
+ */
 func (er erasureObjects) getObjectWithFileInfo(ctx context.Context, bucket, object string, startOffset int64, length int64, writer io.Writer, etag string, opts ObjectOptions, fi FileInfo, metaArr []FileInfo, onlineDisks []StorageAPI) error {
 	// Reorder online disks based on erasure distribution order.
 	onlineDisks = shuffleDisks(onlineDisks, fi.Erasure.Distribution)
@@ -215,6 +242,9 @@ func (er erasureObjects) getObjectWithFileInfo(ctx context.Context, bucket, obje
 	metaArr = shufflePartsMetadata(metaArr, fi.Erasure.Distribution)
 
 	// For negative length read everything.
+	/*
+	 * lengh < 0 , 表示从偏移量读取全部
+	 */
 	if length < 0 {
 		length = fi.Size - startOffset
 	}
@@ -226,6 +256,9 @@ func (er erasureObjects) getObjectWithFileInfo(ctx context.Context, bucket, obje
 	}
 
 	// Get start part index and offset.
+	/*
+	 * 顺序找块，通过offset，怎么编码的呢？
+	 */
 	partIndex, partOffset, err := fi.ObjectToPartOffset(ctx, startOffset)
 	if err != nil {
 		return InvalidRange{startOffset, length, fi.Size}
@@ -333,6 +366,9 @@ func (er erasureObjects) getObject(ctx context.Context, bucket, object string, s
 }
 
 // getObjectInfoDir - This getObjectInfo is specific to object directory lookup.
+/*
+ * 1. 对象没有数据，只有空的目录
+ */
 func (er erasureObjects) getObjectInfoDir(ctx context.Context, bucket, object string) (ObjectInfo, error) {
 	storageDisks := er.getDisks()
 
@@ -380,6 +416,9 @@ func (er erasureObjects) GetObjectInfo(ctx context.Context, bucket, object strin
 	return er.getObjectInfo(ctx, bucket, object, opts)
 }
 
+/*
+ * 读取指定 VersionID 的 xl.meta
+ */
 func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (fi FileInfo, metaArr []FileInfo, onlineDisks []StorageAPI, err error) {
 	disks := er.getDisks()
 
@@ -408,6 +447,9 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 }
 
 // getObjectInfo - wrapper for reading object metadata and constructs ObjectInfo.
+/*
+ * 1. 获取 xl.meta 数据，然后判断是否 delete
+ */
 func (er erasureObjects) getObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
 	fi, _, _, err := er.getObjectFileInfo(ctx, bucket, object, opts)
 	if err != nil {
@@ -544,6 +586,9 @@ func rename(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry, dstBuc
 // object operations.
 func (er erasureObjects) PutObject(ctx context.Context, bucket string, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
 	// Validate put object input args.
+	/*
+	 * bucket 是否存在，object 命名是否符合规范
+	 */
 	if err = checkPutObjectArgs(ctx, bucket, object, er, data.Size()); err != nil {
 		return ObjectInfo{}, err
 	}
@@ -552,6 +597,12 @@ func (er erasureObjects) PutObject(ctx context.Context, bucket string, object st
 }
 
 // putObject wrapper for erasureObjects PutObject
+/*
+ * 主体流程 与  mutilpart 一致
+ * 1. 先写数据到临时目录，/diskpath/.minio.sys/tmp/uniqueID(随机ID)/${fi.DataDir}(ID)/part.1
+ * 2. 写 xl.meta 到临时目录，/diskpath/.minio.sys/tmp/uniqueID(随机ID)/xl.meta
+ * 3. rename /diskpath/.minio.sys/tmp/uniqueID(随机ID) /diskpath/bucket/object
+ */
 func (er erasureObjects) putObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
 	defer ObjectPathUpdated(path.Join(bucket, object))
 
@@ -583,19 +634,31 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	// Delete temporary object in the event of failure.
 	// If PutObject succeeded there would be no temporary
 	// object to delete.
+	/*
+	 * /diskpath/.minio.sys/tmp/uniqueID(随机ID)
+	 */
 	defer er.deleteObject(ctx, minioMetaTmpBucket, tempObj, writeQuorum)
 
 	// This is a special case with size as '0' and object ends with
 	// a slash separator, we treat it like a valid operation and
 	// return success.
+	/*
+	 * object "/" 结尾 && data.size() == 0
+	 */
 	if isObjectDir(object, data.Size()) {
 		// Check if an object is present as one of the parent dir.
 		// -- FIXME. (needs a new kind of lock).
 		// -- FIXME (this also causes performance issue when disks are down).
+		/*
+		 * 确定 object 的父目录不属于其他的对象
+		 */
 		if er.parentDirIsObject(ctx, bucket, path.Dir(object)) {
 			return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
 		}
 
+		/*
+		 * mkdir /diskpath/bucket/object
+		 */
 		if err = er.putObjectDir(ctx, bucket, object, writeQuorum); err != nil {
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
@@ -612,6 +675,9 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	// Check if an object is present as one of the parent dir.
 	// -- FIXME. (needs a new kind of lock).
 	// -- FIXME (this also causes performance issue when disks are down).
+	/*
+	 * 确定 object 的父目录不属于其他的对象
+	 */
 	if er.parentDirIsObject(ctx, bucket, path.Dir(object)) {
 		return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
 	}
@@ -635,6 +701,9 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	}
 
 	// Order disks according to erasure distribution
+	/*
+	 * 根据 fi.Erasure.Distribution 分布 重拍 disk
+	 */
 	onlineDisks := shuffleDisks(storageDisks, fi.Erasure.Distribution)
 
 	erasure, err := NewErasure(ctx, fi.Erasure.DataBlocks, fi.Erasure.ParityBlocks, fi.Erasure.BlockSize)
@@ -817,6 +886,9 @@ func (er erasureObjects) deleteObject(ctx context.Context, bucket, object string
 // DeleteObjects deletes objects/versions in bulk, this function will still automatically split objects list
 // into smaller bulks if some object names are found to be duplicated in the delete list, splitting
 // into smaller bulks will avoid holding twice the write lock of the duplicated object names.
+/*
+ * 批量删除 Objects，内部核心逻辑与 DeleteObject 相同
+ */
 func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
 	errs := make([]error, len(objects))
 	dobjects := make([]DeletedObject, len(objects))
@@ -936,6 +1008,11 @@ func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objec
 // DeleteObject - deletes an object, this call doesn't necessary reply
 // any error as it is not necessary for the handler to reply back a
 // response to the client request.
+/*
+ * 1. 未指定版本号删除，只是追加 xl.meta 但是没有删除数据（versionID 随机生成）
+ * 2. 指定版本号删除，追加 xl.meta 数据，并删除对应的数据，如果是最后一个数据，带Object 目录一起删除
+ * 3. 多数磁盘删除成功，部分不成功，则交给另外一个模块处理
+ */
 func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
 	if err = checkDelObjArgs(ctx, bucket, object); err != nil {
 		return objInfo, err
@@ -944,6 +1021,13 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 	storageDisks := er.getDisks()
 	writeQuorum := len(storageDisks)/2 + 1
 
+	/*
+	 * /diskpath/bucket/object
+	 * 下面存储 xl.meta，内部维护元数据，但是是分版本的
+	 * 下面的目录（/${fi.DataDir}）可以是多个，不同版本的数据
+	 * 下面是指定未版本删除， deleteObjectVersion 内部删除 xl.meta 对应的版本（标记删除，追加一个删除的version）
+	 * 	但是并没有删除数据
+	 */
 	if opts.VersionID == "" {
 		if opts.Versioned && !HasSuffix(object, SlashSeparator) {
 			fi := FileInfo{
@@ -961,6 +1045,10 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 	}
 
 	// Delete the object version on all disks.
+	/*
+	 * 下面是指定版本删除， deleteObjectVersion 内部删除 xl.meta 对应的版本（标记删除,追加一个version，类型是删除），并删除对应版本的数据
+	 * 	如果是最后一个版本，整个 object 目录一起删除
+	 */
 	if err = er.deleteObjectVersion(ctx, bucket, object, writeQuorum, FileInfo{
 		Name:      object,
 		VersionID: opts.VersionID,
@@ -970,6 +1058,9 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 
 	for _, disk := range storageDisks {
 		if disk == nil {
+			/*
+			 * 表示部分删除成功，部分删除失败，通过管道给另外一个模块实例，但是已经达到删除目标数量的标准了
+			 */
 			er.addPartial(bucket, object, opts.VersionID)
 			break
 		}
@@ -1015,6 +1106,9 @@ func (er erasureObjects) PutObjectTags(ctx context.Context, bucket, object strin
 		return toObjectErr(errMethodNotAllowed, bucket, object)
 	}
 
+	/*
+	 * 仅仅是修改 X-Amz-Tagging 这个 tag
+	 */
 	for i, fi := range metaArr {
 		if errs[i] != nil {
 			// Avoid disks where loading metadata fail

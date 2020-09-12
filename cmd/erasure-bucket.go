@@ -33,7 +33,20 @@ var bucketMetadataOpIgnoredErrs = append(bucketOpIgnoredErrs, errVolumeNotFound)
 
 /// Bucket operations
 
+/*
+ * Bucket 级别的操作
+ * 	MakeBucket
+ * 	GetBucketInfo（单个信息）
+ * 	ListBuckets（全部信息）
+ * 	DeleteBucket
+ */
+
+
 // MakeBucket - make a bucket.
+/*
+ * 获取 erasureObjects 的 disks，调用本地、远程disk 的 makevol 接口创建路径
+ * 创建 diskpath/volume 文件，所以 volume 就是 bucket 
+ */
 func (er erasureObjects) MakeBucketWithLocation(ctx context.Context, bucket string, opts BucketOptions) error {
 	// Verify if bucket is valid.
 	if err := s3utils.CheckValidBucketNameStrict(bucket); err != nil {
@@ -85,13 +98,25 @@ func undoDeleteBucket(storageDisks []StorageAPI, bucket string) {
 }
 
 // getBucketInfo - returns the BucketInfo from one of the load balanced disks.
+/*
+ * 在所有的磁盘中重拍顺序但是相对顺序不变，然后按顺序发送 StatVol 请求，有一个返回则成功则直接返回
+ * 返回的信息 BucketInfo 包括volume 名字 和 最后的修改时间
+ */
 func (er erasureObjects) getBucketInfo(ctx context.Context, bucketName string) (bucketInfo BucketInfo, err error) {
 	var bucketErrs []error
+	/*
+	 * getLoadBalancedDisks 重新对 Disk 随机排序，但是排序的相对位置不变
+	 * 1，2，3，4，5，6
+	 * 3，4，5，6，1，2
+	 */
 	for _, disk := range er.getLoadBalancedDisks() {
 		if disk == nil {
 			bucketErrs = append(bucketErrs, errDiskNotFound)
 			continue
 		}
+		/*
+		 * disk.StatVol 返回 volume 名字，以及最后修改时间（作为创建时间）
+		 */
 		volInfo, serr := disk.StatVol(bucketName)
 		if serr == nil {
 			return BucketInfo(volInfo), nil
@@ -137,6 +162,9 @@ func (er erasureObjects) listBuckets(ctx context.Context) (bucketsInfo []BucketI
 			// should take care of this.
 			var bucketsInfo []BucketInfo
 			for _, volInfo := range volsInfo {
+				/*
+				 * s3 命名规范
+				 */
 				if isReservedOrInvalidBucket(volInfo.Name, true) {
 					continue
 				}
@@ -178,6 +206,9 @@ func (er erasureObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) 
 // the dangling objects. All of this happens under a lock and there
 // is no way a user can create buckets and sneak in objects into namespace,
 // so it is safer to do.
+/*
+ * 针对 errVolumeNotEmpty 错误的磁盘进行前置删除
+ */
 func deleteDanglingBucket(ctx context.Context, storageDisks []StorageAPI, dErrs []error, bucket string) {
 	for index, err := range dErrs {
 		if err == errVolumeNotEmpty {
@@ -195,6 +226,15 @@ func deleteDanglingBucket(ctx context.Context, storageDisks []StorageAPI, dErrs 
 }
 
 // DeleteBucket - deletes a bucket.
+/*
+ * 1. 首先，删除，/diskpath/bufket
+ * 2. 其次，删除元数据，/diskpath/.minio.sys/multipart/bucket 下面的内容
+ * 3. 最后处理异常情况：
+ * 	3.1 如果设置了 forceDelete，则有一个 disk 返回 err，则恢复所有的 bucket
+ * 	3.2 如果没有达到 qurom ，则恢复所有的 bucket
+ * 	3.3 针对 errVolumeNotEmpty 错误进行处理（悬空桶），只有有悬空对象才会有这种问题（既删除的一定是空桶），此时会强制删除
+ * 	注意：针对 3.3 注释说应该在锁的情况下进行更安全（可能是在上层调用）。
+ */
 func (er erasureObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
 	// Collect if all disks report volume not found.
 	storageDisks := er.getDisks()
@@ -205,9 +245,16 @@ func (er erasureObjects) DeleteBucket(ctx context.Context, bucket string, forceD
 		index := index
 		g.Go(func() error {
 			if storageDisks[index] != nil {
+				/*
+				 * delete dir /diskpath/volume
+				 */
 				if err := storageDisks[index].DeleteVol(bucket, forceDelete); err != nil {
 					return err
 				}
+				/*
+				 * minioMetaMultipartBucket = .minio.sys/multipart
+				 * 1. 递归 delete /diskpath/.minio.sys/multipart/bucket
+				 */
 				err := cleanupDir(ctx, storageDisks[index], minioMetaMultipartBucket, bucket)
 				if err != nil && err != errVolumeNotFound {
 					return err
@@ -224,6 +271,9 @@ func (er erasureObjects) DeleteBucket(ctx context.Context, bucket string, forceD
 	if forceDelete {
 		for _, err := range dErrs {
 			if err != nil {
+				/*
+				 * 有一个磁盘没有删除成功，则全部执行 makevol 重新创建 bucket
+				 */
 				undoDeleteBucket(storageDisks, bucket)
 				return toObjectErr(err, bucket)
 			}

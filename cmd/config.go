@@ -204,7 +204,11 @@ func initConfig(objAPI ObjectLayer) error {
 		return errServerNotInitialized
 	}
 
+	/*
+	 * getConfigFile() == ~/.minio/config.json
+	 */
 	if isFile(getConfigFile()) {
+		/* config 升级 */
 		if err := migrateConfig(); err != nil {
 			return err
 		}
@@ -215,11 +219,17 @@ func initConfig(objAPI ObjectLayer) error {
 	// ignore if the file doesn't exist.
 	// If etcd is set then migrates /config/config.json
 	// to '<export_path>/.minio.sys/config/config.json'
+	/*
+	 * /diskpath/.minio.sys/config/config.json
+	 */
 	if err := migrateConfigToMinioSys(objAPI); err != nil {
 		return err
 	}
 
 	// Migrates backend '<export_path>/.minio.sys/config/config.json' to latest version.
+	/*
+	 * migrateV32ToV33MinioSys 升级到 33 
+	 */
 	if err := migrateMinioSysConfig(objAPI); err != nil {
 		return err
 	}
@@ -230,5 +240,8 @@ func initConfig(objAPI ObjectLayer) error {
 		return err
 	}
 
+	/*
+	 * env 会覆盖 config.json 的内容
+	 */
 	return loadConfig(objAPI)
 }

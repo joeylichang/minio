@@ -109,7 +109,7 @@ func newFileInfo(object string, dataBlocks, parityBlocks int) (fi FileInfo) {
 		Algorithm:    erasureAlgorithm,
 		DataBlocks:   dataBlocks,
 		ParityBlocks: parityBlocks,
-		BlockSize:    blockSizeV1,
+		BlockSize:    blockSizeV1, 		// 10 * 1024 * 1024 = 10 Mib
 		Distribution: hashOrder(object, dataBlocks+parityBlocks),
 	}
 	return fi

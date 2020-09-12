@@ -33,6 +33,18 @@ func initLocalDisksAutoHeal(ctx context.Context, objAPI ObjectLayer) {
 // monitorLocalDisksAndHeal - ensures that detected new disks are healed
 //  1. Only the concerned erasure set will be listed and healed
 //  2. Only the node hosting the disk is responsible to perform the heal
+/*
+ * 作用：
+ * 	1. Format Heal
+ * 	2. Bucket Heal
+ *
+ * 逻辑：
+ * 	1. 只检查本地 disk 是否有 format.json ，没有则收集起来，发送给 heal 模块后端进行修复
+ * 		2.1 如果一个zone 中有多个 set，本地的磁盘不一定在所有的 set，那么就有set 没有检查到啊？
+ * 	2. 针对这些缺失 format 的磁盘，在reload 之后进行数据 heal
+ *
+ * 注意： 上述流程周期 3 min
+ */
 func monitorLocalDisksAndHeal(ctx context.Context, objAPI ObjectLayer) {
 	z, ok := objAPI.(*erasureZones)
 	if !ok {
@@ -55,6 +67,9 @@ func monitorLocalDisksAndHeal(ctx context.Context, objAPI ObjectLayer) {
 		select {
 		case <-ctx.Done():
 			return
+		/*
+		 * 1. 周期 3 min
+		 */
 		case <-time.After(defaultMonitorNewDiskInterval):
 			// Attempt a heal as the server starts-up first.
 			localDisksInZoneHeal := make([]Endpoints, len(z.zones))

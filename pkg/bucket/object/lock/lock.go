@@ -527,6 +527,9 @@ func FilterObjectLockMetadata(metadata map[string]string, filterRetention, filte
 	}
 	legalHold := GetObjectLegalHoldMeta(metadata)
 	if !legalHold.Status.Valid() || filterLegalHold {
+		/*
+		 *  write-once-read-many 
+		 */
 		delKey(AmzObjectLockLegalHold)
 	}
 

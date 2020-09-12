@@ -24,6 +24,9 @@ import (
 )
 
 // commonTime returns a maximally occurring time from a list of time.
+/*
+ * 返回时间出现次数最多，同样多则选时间最大的返回
+ */
 func commonTime(modTimes []time.Time) (modTime time.Time, count int) {
 	var maxima int // Counter for remembering max occurrence of elements.
 	timeOccurenceMap := make(map[time.Time]int)
@@ -50,6 +53,9 @@ func commonTime(modTimes []time.Time) (modTime time.Time, count int) {
 var timeSentinel = time.Unix(0, 0).UTC()
 
 // Boot modTimes up to disk count, setting the value to time sentinel.
+/*
+ * 初始化 diskCount 个时间数组，所有的时间初始化为 0
+ */
 func bootModtimes(diskCount int) []time.Time {
 	modTimes := make([]time.Time, diskCount)
 	// Boots up all the modtimes.
@@ -175,8 +181,14 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
 			// disk has a valid xl.meta but may not have all the
 			// parts. This is considered an outdated disk, since
 			// it needs healing too.
+			/*
+			 * bitrot 级别检查 part 内部数据
+			 */
 			dataErrs[i] = onlineDisk.VerifyFile(bucket, object, partsMetadata[i])
 		case madmin.HealNormalScan:
+			/*
+			 * 查看 part 文件是否存在
+			 */
 			dataErrs[i] = onlineDisk.CheckParts(bucket, object, partsMetadata[i])
 		}
 

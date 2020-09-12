@@ -24,6 +24,11 @@ import (
 )
 
 // getLoadBalancedDisks - fetches load balanced (sufficiently randomized) disk slice.
+/*
+ * 重新对 Disk 随机排序，但是排序的相对位置不变
+ * 1，2，3，4，5，6
+ * 3，4，5，6，1，2
+ */
 func (er erasureObjects) getLoadBalancedDisks() (newDisks []StorageAPI) {
 	disks := er.getDisks()
 	// Based on the random shuffling return back randomized disks.

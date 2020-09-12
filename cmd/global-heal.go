@@ -81,6 +81,12 @@ func getLocalBackgroundHealStatus() madmin.BgHealState {
 }
 
 // healErasureSet lists and heals all objects in a specific erasure set
+/*
+ * 1. list 所有的 bucket
+ * 2. 加上 /diskpath/.minio.sys/config  和 /diskpath/.minio.sys/buckets
+ * 3. 遍历所有的磁盘及其上面的文件，然后根据副本数进行比对
+ * 4. 对于有缺少的副本数，则发送给管道 sourceCh
+ */
 func healErasureSet(ctx context.Context, setIndex int, xlObj *erasureObjects, drivesPerSet int) error {
 	buckets, err := xlObj.ListBuckets(ctx)
 	if err != nil {
@@ -162,6 +168,9 @@ func healErasureSet(ctx context.Context, setIndex int, xlObj *erasureObjects, dr
 }
 
 // deepHealObject heals given object path in deep to fix bitrot.
+/*
+ * getObject 是解码遇到错误时，调用其进行修复
+ */
 func deepHealObject(bucket, object, versionID string) {
 	// Get background heal sequence to send elements to heal
 	bgSeq, _ := globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
@@ -188,6 +197,10 @@ func durationToNextHealRound(lastHeal time.Time) time.Duration {
 }
 
 // Healing leader will take the charge of healing all erasure sets
+/*
+ * 1. 无限循环等待 globalBackgroundHealState 初始化完成
+ * 2. 然后每个 30 天，遍历所有的 zone、set，调用一次 healErasureSet 进行全量的数据修复
+ */
 func execLeaderTasks(ctx context.Context, z *erasureZones) {
 	// So that we don't heal immediately, but after one month.
 	lastScanTime := UTCNow()
@@ -195,6 +208,9 @@ func execLeaderTasks(ctx context.Context, z *erasureZones) {
 	var bgSeq *healSequence
 	var ok bool
 	for {
+		/*
+		 * bgHealingUUID = "0000-0000-0000-0000"
+		 */
 		bgSeq, ok = globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
 		if ok {
 			break
@@ -210,6 +226,9 @@ func execLeaderTasks(ctx context.Context, z *erasureZones) {
 		select {
 		case <-ctx.Done():
 			return
+			/*
+			 * 30 days = 30 * 24 * time.Hour
+			 */
 		case <-time.NewTimer(durationToNextHealRound(lastScanTime)).C:
 			bgSeq.resetHealStatusCounters()
 			for _, zone := range z.zones {

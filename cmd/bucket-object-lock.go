@@ -31,6 +31,9 @@ import (
 type BucketObjectLockSys struct{}
 
 // Get - Get retention configuration.
+/*
+ * BucketMetadataSys 内找到对应的 lockconfig
+ */
 func (sys *BucketObjectLockSys) Get(bucketName string) (r objectlock.Retention, err error) {
 	if globalIsGateway {
 		objAPI := newObjectLayerWithoutSafeModeFn()

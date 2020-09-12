@@ -418,6 +418,9 @@ func (d *dataUsageCache) merge(other dataUsageCache) {
 // If the object is not found or unable to deserialize d is cleared and nil error is returned.
 func (d *dataUsageCache) load(ctx context.Context, store ObjectLayer, name string) error {
 	var buf bytes.Buffer
+	/*
+	 * /diskpath/.minio.sys/buckets/.usage-cache.bin
+	 */
 	err := store.GetObject(ctx, dataUsageBucket, name, 0, -1, &buf, "", ObjectOptions{})
 	if err != nil {
 		if !isErrObjectNotFound(err) && !isErrBucketNotFound(err) && !errors.Is(err, InsufficientReadQuorum{}) {

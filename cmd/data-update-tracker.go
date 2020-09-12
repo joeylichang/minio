@@ -45,6 +45,7 @@ const (
 	dataUpdateTrackerFP        = 0.99
 	dataUpdateTrackerQueueSize = 10000
 
+	// .minio.sys/buckets/.tracker.bin
 	dataUpdateTrackerFilename     = dataUsageBucket + SlashSeparator + ".tracker.bin"
 	dataUpdateTrackerVersion      = 2
 	dataUpdateTrackerSaveInterval = 5 * time.Minute
@@ -72,7 +73,7 @@ type dataUpdateTracker struct {
 	dirty      bool
 
 	Current dataUpdateFilter
-	History dataUpdateTrackerHistory
+	History dataUpdateTrackerHistory 	// []dataUpdateFilter
 	Saved   time.Time
 }
 
@@ -83,8 +84,8 @@ func newDataUpdateTracker() *dataUpdateTracker {
 			idx: 1,
 		},
 		debug:      env.Get(envDataUsageCrawlDebug, config.EnableOff) == config.EnableOn,
-		input:      make(chan string, dataUpdateTrackerQueueSize),
-		save:       make(chan struct{}, 1),
+		input:      make(chan string, dataUpdateTrackerQueueSize), 	// 10000
+		save:       make(chan struct{}, 1), 						// 1
 		saveExited: make(chan struct{}),
 	}
 	d.Current.bf = d.newBloomFilter()
@@ -111,6 +112,9 @@ func emptyBloomFilter() bloomFilter {
 // containsDir returns whether the bloom filter contains a directory.
 // Note that objects in XL mode are also considered directories.
 func (b bloomFilter) containsDir(in string) bool {
+	/*
+	 * 去掉 "."、"/" 之后的前三个路径节点
+	 */
 	split := splitPathDeterministic(path.Clean(in))
 
 	if len(split) == 0 {
@@ -161,6 +165,10 @@ func (d *dataUpdateTrackerHistory) removeOlderThan(n uint64) {
 
 // newBloomFilter returns a new bloom filter with default settings.
 func (d *dataUpdateTracker) newBloomFilter() bloomFilter {
+	/*
+	 * dataUpdateTrackerEstItems = 1 millon
+	 * dataUpdateTrackerFP = 0.99
+	 */
 	return bloomFilter{bloom.NewWithEstimates(dataUpdateTrackerEstItems, dataUpdateTrackerFP)}
 }
 
@@ -180,7 +188,15 @@ func (d *dataUpdateTracker) start(ctx context.Context, drives ...string) {
 		return
 	}
 	d.load(ctx, drives...)
+	/*
+	 * 1. 通过接口 ObjectPathUpdated 收集上层业务更新的 object/Object 数据
+	 * 2. 然后加入到 Current 的 bloomfilter
+	 */
 	go d.startCollector(ctx)
+	/*
+	 * dataUpdateTrackerSaveInterval = 5min
+	 * drives = local_disk
+	 */
 	go d.startSaver(ctx, dataUpdateTrackerSaveInterval, drives)
 }
 
@@ -196,6 +212,9 @@ func (d *dataUpdateTracker) load(ctx context.Context, drives ...string) {
 	}
 	for _, drive := range drives {
 
+		/* 
+		 * .minio.sys/buckets/.tracker.bin
+		 */
 		cacheFormatPath := pathJoin(drive, dataUpdateTrackerFilename)
 		f, err := os.Open(cacheFormatPath)
 		if err != nil {
@@ -205,6 +224,10 @@ func (d *dataUpdateTracker) load(ctx context.Context, drives ...string) {
 			logger.LogIf(ctx, err)
 			continue
 		}
+		/*
+		 * 读取文件的内容，更新 dataUpdateTracker 的
+		 * Current、History、Saved
+		 */
 		err = d.deserialize(f, d.Saved)
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			logger.LogIf(ctx, err)
@@ -215,6 +238,11 @@ func (d *dataUpdateTracker) load(ctx context.Context, drives ...string) {
 
 // startSaver will start a saver that will write d to all supplied drives at specific intervals.
 // The saver will save and exit when supplied context is closed.
+/*
+ * 1. 周期（5min）或者受到管道 d.save 的消息，将数据落盘
+ * 2. serialize 序列化数据
+ * 3. 写入到 .minio.sys/buckets/.tracker.bin
+ */
 func (d *dataUpdateTracker) startSaver(ctx context.Context, interval time.Duration, drives []string) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -435,6 +463,10 @@ func (d *dataUpdateTracker) deserialize(src io.Reader, newerThan time.Time) erro
 
 // start a collector that picks up entries from objectUpdatedCh
 // and adds them  to the current bloom filter.
+/*
+ * 1. 通过接口 ObjectPathUpdated 收集上层业务更新的 object/Object 数据
+ * 2. 然后加入到 Current 的 bloomfilter
+ */
 func (d *dataUpdateTracker) startCollector(ctx context.Context) {
 	for {
 		select {
@@ -455,6 +487,9 @@ func (d *dataUpdateTracker) startCollector(ctx context.Context) {
 				}
 				continue
 			}
+			/*
+			 * 返回前3个路径名
+			 */
 			split := splitPathDeterministic(in)
 
 			// Add all paths until level 3.
@@ -531,6 +566,12 @@ func (d *dataUpdateTracker) filterFrom(ctx context.Context, oldest, newest uint6
 // The response will contain a bloom filter starting at index x up to, but not including index y.
 // If y is 0, the response will not update y, but return the currently recorded information
 // from the up until and including current y.
+/*
+ * 1. 生成一个新的 current filter
+ * 2. 将current 移到 history
+ * 3. 删除 oldest 之前的所有filter
+ * 4. 通过 d.save 管道，通知协程去落盘
+ */
 func (d *dataUpdateTracker) cycleFilter(ctx context.Context, oldest, current uint64) (*bloomFilterResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

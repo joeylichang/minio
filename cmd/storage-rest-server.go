@@ -846,8 +846,14 @@ func registerStorageRESTHandlers(router *mux.Router, endpointZones EndpointZones
 
 			server := &storageRESTServer{storage: storage}
 
+			/*
+			 * storageRESTPrefix = "/minio/storage"
+			 */
 			subrouter := router.PathPrefix(path.Join(storageRESTPrefix, endpoint.Path)).Subrouter()
 
+			/*
+			 * storageRESTVersionPrefix = "/v20"
+			 */
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodHealth).HandlerFunc(httpTraceHdrs(server.HealthHandler))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodDiskInfo).HandlerFunc(httpTraceHdrs(server.DiskInfoHandler))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodCrawlAndGetDataUsage).HandlerFunc(httpTraceHdrs(server.CrawlAndGetDataUsageHandler))

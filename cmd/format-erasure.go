@@ -353,6 +353,12 @@ func saveFormatErasure(disk StorageAPI, format interface{}, diskID string) error
 		return errDiskNotFound
 	}
 
+	/*
+	 * minioMetaBucket 		= "diskpath/.minio.sys"
+	 * minioMetaTmpBucket 	= "diskpath/.minio.sys/tmp"
+	 * minioMetaTmpBucket 	= "diskpath/.minio.sys/multipart"
+	 * dataUsageBucket 		= "diskpath/.minio.sys/buckets"
+	 */
 	if err := makeFormatErasureMetaVolumes(disk); err != nil {
 		return err
 	}
@@ -727,6 +733,7 @@ func closeStorageDisks(storageDisks []StorageAPI) {
 		if disk == nil {
 			continue
 		}
+		/* 全部返回 nil，未实现*/
 		disk.Close()
 	}
 }
@@ -810,6 +817,9 @@ func fixFormatErasureV3(storageDisks []StorageAPI, endpoints Endpoints, formats 
 func initFormatErasure(ctx context.Context, storageDisks []StorageAPI, setCount, drivesPerSet int, deploymentID string) (*formatErasureV3, error) {
 	format := newFormatErasureV3(setCount, drivesPerSet)
 	formats := make([]*formatErasureV3, len(storageDisks))
+	/*
+	 * drivesPerSet / 2
+	 */
 	wantAtMost := ecDrivesNoConfig(drivesPerSet)
 
 	for i := 0; i < setCount; i++ {
@@ -878,6 +888,12 @@ func makeFormatErasureMetaVolumes(disk StorageAPI) error {
 		return errDiskNotFound
 	}
 	// Attempt to create MinIO internal buckets.
+	/*
+	 * minioMetaBucket 		= ".minio.sys"
+	 * minioMetaTmpBucket 	= ".minio.sys/tmp"
+	 * minioMetaTmpBucket 	= ".minio.sys/multipart"
+	 * dataUsageBucket 		= ".minio.sys/buckets"
+	 */
 	return disk.MakeVolBulk(minioMetaBucket, minioMetaTmpBucket, minioMetaMultipartBucket, dataUsageBucket)
 }
 

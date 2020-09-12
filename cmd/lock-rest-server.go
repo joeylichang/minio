@@ -59,14 +59,14 @@ func (l *lockRESTServer) IsValid(w http.ResponseWriter, r *http.Request) bool {
 
 func getLockArgs(r *http.Request) (args dsync.LockArgs, err error) {
 	args = dsync.LockArgs{
-		UID:    r.URL.Query().Get(lockRESTUID),
-		Source: r.URL.Query().Get(lockRESTSource),
+		UID:    r.URL.Query().Get(lockRESTUID), 	// 唯一表示
+		Source: r.URL.Query().Get(lockRESTSource),  // 客户端调用锁的位置（文件、函数、行号）
 	}
 
 	var resources []string
 	bio := bufio.NewScanner(r.Body)
 	for bio.Scan() {
-		resources = append(resources, bio.Text())
+		resources = append(resources, bio.Text()) 	// 用于解锁、加锁的内容，[]string
 	}
 
 	if err := bio.Err(); err != nil {
@@ -96,6 +96,10 @@ func (l *lockRESTServer) LockHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	/*
+	 * 1. 内部遍历 args.resource , 检查 localLocker.lockMap[resource] 是否所有的资源都没有上锁
+	 * 2. lockMap[resource] -> lockRequesterInfo(Source: args.Source, UID: args.UID,)
+	 */
 	success, err := l.ll.Lock(args)
 	if err == nil && !success {
 		err = errLockConflict
@@ -119,6 +123,11 @@ func (l *lockRESTServer) UnlockHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	/*
+	 * 与上面加锁的逻辑相反
+	 * 1. 检查是否所有的资源都在上锁
+	 * 2. 都在的话在 lockMap 删除相应的 lockRequesterInfo
+	 */
 	_, err = l.ll.Unlock(args)
 	// Ignore the Unlock() "reply" return value because if err == nil, "reply" is always true
 	// Consequently, if err != nil, reply is always false
@@ -141,6 +150,10 @@ func (l *lockRESTServer) RLockHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	/*
+	 * lockMap[resource] 对应的数组，记录的是所有的锁信息
+	 * 只有读锁可以是多个，写锁只能有一个，并且 Writer 为 true
+	 */
 	success, err := l.ll.RLock(args)
 	if err == nil && !success {
 		err = errLockConflict
@@ -173,6 +186,9 @@ func (l *lockRESTServer) RUnlockHandler(w http.ResponseWriter, r *http.Request) 
 }
 
 // ExpiredHandler - query expired lock status.
+/*
+ * 查询一个 lock 是否过期，通过 lockMaintenance 或者其他 Unlock 接口删除了
+ */
 func (l *lockRESTServer) ExpiredHandler(w http.ResponseWriter, r *http.Request) {
 	if !l.IsValid(w, r) {
 		l.writeErrorResponse(w, errors.New("Invalid request"))
@@ -210,6 +226,15 @@ type nameLockRequesterInfoPair struct {
 
 // getLongLivedLocks returns locks that are older than a certain time and
 // have not been 'checked' for validity too soon enough
+/*
+ * 1. 遍历 globalLockServers （localenpoint -> localLocker）
+ * 2. 遍历 localLocker.lockMap（name -> lockRequesterInfo）
+ *
+ * 对于超过 2min 的锁信息放入 nameLockRequesterInfoPair（Endpoint ->[] name, lockRequesterInfo）
+ * Endpoint : localendpoint 应该只有一个
+ * name : 锁的名字
+ * lockRequesterInfo : 锁的信息
+ */
 func getLongLivedLocks(interval time.Duration) map[Endpoint][]nameLockRequesterInfoPair {
 	nlripMap := make(map[Endpoint][]nameLockRequesterInfoPair)
 	for endpoint, locker := range globalLockServers {
@@ -238,6 +263,16 @@ func getLongLivedLocks(interval time.Duration) map[Endpoint][]nameLockRequesterI
 // - some network error (and server is up normally)
 //
 // We will ignore the error, and we will retry later to get a resolve on this lock
+/*
+ * 1. 获取当前节点上所有过期的锁（超过2min 没有被check），组织形式 localendpoint-> <[]locakname, lockinfo>
+ * 2. 向 zone0 中所有的节点发送 expire 请求，判断节点是否 过期
+ * 	2.1 对于网络异常、当前节点判断其他节点不再线 等情况都视为成功
+ * 3. 若果判断没有没有的节点个数少于 quorum，则删除 locakname 下对应的 lockinfo
+ * 	3.1 读锁 quorum = globalErasureSetDriveCount（EC编码分块数量） / 2
+ * 	3.2 写锁 quorum = globalErasureSetDriveCount（EC编码分块数量） / 2 + 1
+ * 注意： 为什么不是机器数量，而是分块数量呢？很奇怪
+ * 	如果是 32台机器，分块数量肯定是 16
+ */
 func lockMaintenance(ctx context.Context, interval time.Duration) error {
 	// Validate if long lived locks are indeed clean.
 	// Get list of long lived locks to check for staleness.
@@ -312,6 +347,9 @@ func startLockMaintenance(ctx context.Context) {
 	}
 
 	// Initialize a new ticker with a minute between each ticks.
+	/*
+	 * lockMaintenanceInterval == 1min
+	 */
 	ticker := time.NewTicker(lockMaintenanceInterval)
 	// Stop the timer upon service closure and cleanup the go-routine.
 	defer ticker.Stop()
@@ -325,8 +363,14 @@ func startLockMaintenance(ctx context.Context) {
 		case <-ticker.C:
 			// Start with random sleep time, so as to avoid
 			// "synchronous checks" between servers
+			/*
+			 * 分钟级的随机事件，需要整体理解这部分表面冲突的逻辑
+			 */
 			duration := time.Duration(r.Float64() * float64(lockMaintenanceInterval))
 			time.Sleep(duration)
+			/*
+			 * lockValidityCheckInterval == 2min
+			 */
 			if err := lockMaintenance(ctx, lockValidityCheckInterval); err != nil {
 				// Sleep right after an error.
 				duration := time.Duration(r.Float64() * float64(lockMaintenanceInterval))
@@ -341,6 +385,9 @@ func registerLockRESTHandlers(router *mux.Router, endpointZones EndpointZones) {
 	queries := restQueries(lockRESTUID, lockRESTSource)
 	for _, ep := range endpointZones {
 		for _, endpoint := range ep.Endpoints {
+			/*
+			 * ip port 都相同才判定为 local
+			 */
 			if !endpoint.IsLocal {
 				continue
 			}
@@ -357,6 +404,7 @@ func registerLockRESTHandlers(router *mux.Router, endpointZones EndpointZones) {
 			subrouter.Methods(http.MethodPost).Path(lockRESTVersionPrefix + lockRESTMethodRUnlock).HandlerFunc(httpTraceHdrs(lockServer.RUnlockHandler)).Queries(queries...)
 			subrouter.Methods(http.MethodPost).Path(lockRESTVersionPrefix + lockRESTMethodExpired).HandlerFunc(httpTraceAll(lockServer.ExpiredHandler)).Queries(queries...)
 
+			// 理论上只有当前节点的信息
 			globalLockServers[endpoint] = lockServer.ll
 		}
 	}

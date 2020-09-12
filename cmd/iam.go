@@ -200,23 +200,53 @@ func newMappedPolicy(policy string) MappedPolicy {
 
 // IAMSys - config system.
 type IAMSys struct {
-	usersSysType UsersSysType
+	/*
+	 * 角色， MinIOUsersSys 默认值，系统内部交互
+	 */
+	usersSysType UsersSysType 
 
 	// map of policy names to policy definitions
+	/*
+	 * iampolicy.Polic 内部主要是一些约束，用于 Allow 接口去判断是否可行
+	 */
 	iamPolicyDocsMap map[string]iampolicy.Policy
+
 	// map of usernames to credentials
+	/*
+	 * Credentials 签名用的一些信息
+	 */
 	iamUsersMap map[string]auth.Credentials
+
 	// map of group names to group info
+	/*
+	 * GroupInfo 内部主要是维护了 成员名
+	 */
 	iamGroupsMap map[string]GroupInfo
+
 	// map of user names to groups they are a member of
+	/*
+	 * 成员与 group 的对应关系
+	 */
 	iamUserGroupMemberships map[string]set.StringSet
+
 	// map of usernames/temporary access keys to policy names
+	/*
+	 * 成员与 Policy 的对应关系
+	 */
 	iamUserPolicyMap map[string]MappedPolicy
+
 	// map of group names to policy names
+	/*
+	 * group 与 Policy 的对应关系
+	 */
 	iamGroupPolicyMap map[string]MappedPolicy
 
 	// Persistence layer for IAM subsystem
 	store         IAMStorageAPI
+
+	/*
+	 * 应该是配置加载的一个标志
+	 */
 	storeFallback bool
 }
 
@@ -415,6 +445,12 @@ func startBackgroundIAMLoad(ctx context.Context) {
 }
 
 // Init - initializes config system by reading entries from config/iam
+/*
+ * 1. 根据配置选择 IAM 信息的存储（ETCD、Minio 特定目录）
+ * 2. 全局锁，对配置进行升级到最新版本
+ * 3. 加载所有的配置信息
+ * 4. 5min 加载一遍 
+ */
 func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer) {
 	if objAPI == nil {
 		logger.LogIf(ctx, errServerNotInitialized)
@@ -422,6 +458,9 @@ func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer) {
 	}
 
 	if globalEtcdClient == nil {
+		/*
+		 * minio 特定目录，来存储 IAM 信息
+		 */
 		sys.store = newIAMObjectStore(ctx, objAPI)
 	} else {
 		sys.store = newIAMEtcdStore(ctx)
@@ -505,6 +544,9 @@ func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer) {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize IAM sub-system, some users may not be available %w", err))
 	}
 
+	/*
+	 * 5 min loadall
+	 */
 	go sys.store.watch(ctx, sys)
 }
 
@@ -1933,6 +1975,9 @@ func (sys *IAMSys) removeGroupFromMembershipsMap(group string) {
 }
 
 // EnableLDAPSys - enable ldap system users type.
+/*
+ * Lightweight Directory Access Protocol
+ */
 func (sys *IAMSys) EnableLDAPSys() {
 	sys.store.lock()
 	defer sys.store.unlock()

@@ -2425,6 +2425,9 @@ func migrateV27ToV28() error {
 // if etcd is configured then migrates /config/config.json to '<export_path>/.minio.sys/config/config.json'
 func migrateConfigToMinioSys(objAPI ObjectLayer) (err error) {
 	// Construct path to config.json for the given bucket.
+	/*
+	 * config/config.json
+	 */
 	configFile := path.Join(minioConfigPrefix, minioConfigFile)
 
 	defer func() {
@@ -2445,9 +2448,9 @@ func migrateConfigToMinioSys(objAPI ObjectLayer) (err error) {
 	} // if errConfigNotFound proceed to migrate..
 
 	var configFiles = []string{
-		getConfigFile(),
-		getConfigFile() + ".deprecated",
-		configFile,
+		getConfigFile(), 					// ~/.minio/config.json
+		getConfigFile() + ".deprecated", 	// ~/.minio/config.json.deprecated
+		configFile, 						// config/config.json
 	}
 	var config = &serverConfigV27{}
 	for _, cfgFile := range configFiles {

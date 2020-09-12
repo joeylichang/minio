@@ -493,6 +493,12 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 // HeadObjectHandler - HEAD Object
 // -----------
 // The HEAD operation retrieves metadata from an object without returning the object itself.
+/*
+ * 作用：
+ * 	获取Object 的元数据
+ * 逻辑：
+ * 	
+ */
 func (api objectAPIHandlers) HeadObjectHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "HeadObject")
 
@@ -503,10 +509,20 @@ func (api objectAPIHandlers) HeadObjectHandler(w http.ResponseWriter, r *http.Re
 		writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(ErrServerNotInitialized))
 		return
 	}
+
+	/*
+	 * SSE 逻辑判断
+	 * 	1. SSE-S3 or SSE-KMS，aws 报错（应该是兼容 aws 语义）
+	 * 	2. api.EncryptionEnabled() 初始化为 true，既必须是 SSEC 加密
+	 * 		注意：S3 只对用户数据进行加密，元数据不进行加密，这里行为有些不一致
+	 *
+	 * 注意：SSE-S3、SSE-KMS、SSEC 都是在 Header 中查找是否有相应字段进行判断
+	 */
 	if crypto.S3.IsRequested(r.Header) || crypto.S3KMS.IsRequested(r.Header) { // If SSE-S3 or SSE-KMS present -> AWS fails with undefined error
 		writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(ErrBadRequest))
 		return
 	}
+	
 	if !api.EncryptionEnabled() && crypto.IsRequested(r.Header) {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrBadRequest), r.URL, guessIsBrowserReq(r))
 		return
@@ -530,6 +546,28 @@ func (api objectAPIHandlers) HeadObjectHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	/*
+	 * checkRequestAuthType 验证签名 && （Bucket 操作权限验证 || 用户权限验证）
+	 * 	1. 签名验证（验证当前请求是否正确——通过签名验证）
+	 * 		1.1 authTypeUnknown、authTypeStreamingSigned 不支持
+	 * 		1.2 PresignedV2、SignedV2 验证是否匹配，匹配的话从请求提取权限验证的信息
+	 * 		1.3 Presigned、Signed 验证的是AWS V4 前面，同样如果匹配的话，从请求提取权限验证信息
+	 * 		1.4 签名验证之后，会从请求中提取 AccessKey 和 owner 信息
+	 * 			1.4.1 AccessKey 直接从请求中提取
+	 * 			1.4.2 owner 判断逻辑如下：
+	 * 				与 globalActiveCred（启动从 ENV 加载） 中 AccessKey 是否一致
+	 * 	2. Bucket 操作权限验证（Bucket 维度校验是否具备相应操作的权限）
+	 * 		2.1 针对 CreateBucketAction，需要从请求中获取 Bucket 创建的地域信息
+	 * 		2.2 如果请求中 AccessKey == ""，通过 Policy 子系统判断当前请求用户是否是 owner 角色，来判断是否可以执行操作
+	 * 		2.2 通过 Policy 配置进行校验，校验项包括：
+	 * 			AccountName(globalActiveCred.AccessKey)、Action、BucketName、ConditionValues（正则）
+	 * 			ObjectName、IsOwner（False）
+	 * 	3. 用户权限验证（请求的用户是否有权限操作）
+	 * 		3.1 如果请求中 AccessKey != ""，通过 IAM 子系统判断是否当前请求
+	 * 		3.1 通过 IAM 系统进行校验，校验项包括：
+	 * 			AccountName(globalActiveCred.AccessKey)、Action、BucketName
+	 * 			ConditionValues、ObjectName、IsOwner(globalActiveCred.AccessKey 是否等于 请求中的 AccessKey)、Claims
+	 */
 	if s3Error := checkRequestAuthType(ctx, r, policy.GetObjectAction, bucket, object); s3Error != ErrNone {
 		if getRequestAuthType(r) == authTypeAnonymous {
 			// As per "Permission" section in
@@ -545,6 +583,9 @@ func (api objectAPIHandlers) HeadObjectHandler(w http.ResponseWriter, r *http.Re
 			// * if you don’t have the s3:ListBucket
 			//   permission, Amazon S3 will return an HTTP
 			//   status code 403 ("access denied") error.`
+			/*
+			 * 从 BucketMetadataSys 中获取 Policy 的配置进行校验
+			 */
 			if globalPolicySys.IsAllowed(policy.Args{
 				Action:          policy.ListBucketAction,
 				BucketName:      bucket,
@@ -561,8 +602,14 @@ func (api objectAPIHandlers) HeadObjectHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	/*
+	 * 从缓存中 get objectInfo，如果没有从磁盘上获取
+	 */
 	objInfo, err := getObjectInfo(ctx, bucket, object, opts)
 	if err != nil {
+		/*
+		 * 获取失败，并且配置没有在变更ing，且 object 对应的版本被删除
+		 */
 		if globalBucketVersioningSys.Enabled(bucket) {
 			// Versioning enabled quite possibly object is deleted might be delete-marker
 			// if present set the headers, no idea why AWS S3 sets these headers.
@@ -576,12 +623,26 @@ func (api objectAPIHandlers) HeadObjectHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	// filter object lock metadata if permission does not permit
+	/*
+	 * checkRequestAuthType 逻辑上面校验过，区别是 Action 
+	 * 	GetObjectRetentionAction、GetObjectLegalHoldAction
+	 * 同样会校验 Bucket 或者 用户权限是否有针对 当前bucket object 的权限
+	 */
 	getRetPerms := checkRequestAuthType(ctx, r, policy.GetObjectRetentionAction, bucket, object)
 	legalHoldPerms := checkRequestAuthType(ctx, r, policy.GetObjectLegalHoldAction, bucket, object)
 
 	// filter object lock metadata if permission does not permit
+	/*
+	 * 1. 如果有 GetObjectRetentionAction 权限，但是 UserDefined 中失效，则在 UserDefined 中删除该项
+	 * 2. GetObjectLegalHoldAction 同上
+	 *
+	 * 对于没有对象保持 和 合法持有 权限的用户，或者相关操作已经过期了，则在元数据中删除相应部分
+	 */
 	objInfo.UserDefined = objectlock.FilterObjectLockMetadata(objInfo.UserDefined, getRetPerms != ErrNone, legalHoldPerms != ErrNone)
 
+	/*
+	 * 永远返回 true
+	 */
 	if objectAPI.IsEncryptionSupported() {
 		if _, err = DecryptObjectInfo(&objInfo, r); err != nil {
 			writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
@@ -590,6 +651,15 @@ func (api objectAPIHandlers) HeadObjectHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	// Validate pre-conditions if any.
+	/*
+	 * 明显的错误校验逻辑
+	 * 1. GET/HEAD 不做校验，直接返回 fasle
+	 * 2. 请求的 PartNumber 大于 objInfo.Parts，返回 true
+	 * 3. 请求的 Modified-Since 时间之后没有修改，返回 true
+	 * 4. 请求的 Unmodified-Since 时间之后有修改，返回 true
+	 * 5. ETag 不匹配指定值，返回 true
+	 * 6. ETag 匹配上指定的值，返回 true
+	 */
 	if checkPreconditions(ctx, w, r, objInfo, opts) {
 		return
 	}
@@ -612,6 +682,9 @@ func (api objectAPIHandlers) HeadObjectHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	// Set encryption response headers
+	/*
+	 * SSE 加密 和 头部信息填写
+	 */
 	if objectAPI.IsEncryptionSupported() {
 		if crypto.IsEncrypted(objInfo.UserDefined) {
 			switch {
@@ -636,6 +709,9 @@ func (api objectAPIHandlers) HeadObjectHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	// Set Parts Count Header
+	/*
+	 * range 部分逻辑
+	 */
 	if opts.PartNumber > 0 && len(objInfo.Parts) > 0 {
 		setPartsCountHeaders(w, objInfo)
 	}
@@ -1309,6 +1385,10 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL, guessIsBrowserReq(r))
 		return
 	}
+
+	/*
+	 * api.AllowSSEKMS() 永远返回 false，既不支持 KMS 秘钥管理方式
+	 */
 	if crypto.S3KMS.IsRequested(r.Header) && !api.AllowSSEKMS() {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r)) // SSE-KMS is not supported
 		return
@@ -1329,12 +1409,29 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	r.Body = &contextReader{r.Body, r.Context()}
 
 	// X-Amz-Copy-Source shouldn't be set for this call.
+	/*
+	 * 带有这个参数实际是一个 copy 操作，在 minio 内部将 Put 与 Copy 严格区分开，与 S3 语义有所不同
+	 * Copy 如果是原地，也是可以的 会更新元数据，但是 ACL 资资源是不会被更新的
+	 * 一般用于一些条件出发，例如在某个时间之前或者之后进行重新 Put，或者 存储类进行变化（节省成本）
+	 */
 	if _, ok := r.Header[xhttp.AmzCopySource]; ok {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidCopySource), r.URL, guessIsBrowserReq(r))
 		return
 	}
 
 	// Validate storage class metadata if present
+	/*
+	 * 存储类校验，minio 仅支持 RRS 和 Standard 两种
+	 * S3 支持如下：
+	 * 	1. S3 Standard：默认
+	 * 	2. RRS：减少冗余度，可能是 EC 编码
+	 * 	3. S3 Intelligent-Tiering：类似冷热分离存储，智能数据迁移
+	 * 	4. S3 Standard-IA：访问延时和 Standard 差不多，应该是省钱吧
+	 * 	5. S3 One Zone-IA ：同上，但是只在一个 zone 内
+	 * 	6. S3 Glacier：仅保存 90天，restore 1-5 min 之后被检索出来，也是降低成本吧？
+	 * 	7. S3 Glacier Deep Archive：180天、restore 12小时之后被检索
+	 * 	Glacier 是一种归档，需要先 restore，之后才能访问，restore 的时间是 1-5min 和 12 小时
+	 */
 	if sc := r.Header.Get(xhttp.AmzStorageClass); sc != "" {
 		if !storageclass.IsValid(sc) {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidStorageClass), r.URL, guessIsBrowserReq(r))
@@ -1343,6 +1440,9 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	// Get Content-Md5 sent by client and verify if valid
+	/*
+	 * 1. 上传的数据的 MD5，checkValidMD5 内部进行了解析，然后返回
+	 */
 	md5Bytes, err := checkValidMD5(r.Header)
 	if err != nil {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidDigest), r.URL, guessIsBrowserReq(r))
@@ -1350,6 +1450,10 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	/// if Content-Length is unknown/missing, deny the request
+	/*
+	 * 获取上传数据的长度
+	 * 如果是 authTypeStreamingSigned，长度在 AmzDecodedContentLength 头部
+	 */
 	size := r.ContentLength
 	rAuthType := getRequestAuthType(r)
 	if rAuthType == authTypeStreamingSigned {
@@ -1371,6 +1475,9 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	/// maximum Upload size for objects in a single operation
+	/*
+	 * 最大单次上传 5T 的数据
+	 */
 	if isMaxObjectSize(size) {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrEntityTooLarge), r.URL, guessIsBrowserReq(r))
 		return
@@ -1382,6 +1489,9 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	/*
+	 * Header "X-Amz-Tagging" 字段解析出来
+	 */
 	if objTags := r.Header.Get(xhttp.AmzObjectTagging); objTags != "" {
 		if !objectAPI.IsTaggingSupported() {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r))
@@ -1406,11 +1516,28 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	reader = r.Body
 
 	// Check if put is allowed
+	/*
+	 * 1. 从请求头中获取 accessKey，如果和 global 中的不同，则从 IAM 中获取 凭证（cred）
+	 * 	global 应该就是 root user ，否则应该是其分配的角色，在 IAM 中
+	 * 	如果是 root user ，则 owner = true， 否则为 false
+	 * 
+	 * 2. 如果是 对象锁 的操作，需要有下面两个字段
+	 * 	"X-Amz-Object-Lock-Mode"/"X-Amz-Object-Lock-Retain-Until-Date"
+	 *
+	 * 3. 如果从上面获取的凭证（cred）中 accessKey 为空，说明…… 什么呢？超级用户？
+	 * 	查看资源权限控制，是否可以进行相应的操作，是否满足相应的约束
+	 *
+	 * 4. 如果从上面获取的凭证（cred）中 accessKey 不为空
+	 * 	则查看用户权限，是否可以进行相应的操作
+	 */
 	if s3Err = isPutActionAllowed(rAuthType, bucket, object, r, iampolicy.PutObjectAction); s3Err != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL, guessIsBrowserReq(r))
 		return
 	}
 
+	/*
+	 * 签名验证，V4 为例，先验证 Header 然后根据参数决定是否验证 Content
+	 */
 	switch rAuthType {
 	case authTypeStreamingSigned:
 		// Initialize stream signature verifier.
@@ -1436,6 +1563,9 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	/*
+	 * quta 校验
+	 */
 	if err := enforceBucketQuota(ctx, bucket, size); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
 		return
@@ -1444,12 +1574,18 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	// Check if bucket encryption is enabled
 	_, err = globalBucketSSEConfigSys.Get(bucket)
 	// This request header needs to be set prior to setting ObjectOptions
+	/*
+	 * 只能是 SSE-C 加密
+	 */
 	if (globalAutoEncryption || err == nil) && !crypto.SSEC.IsRequested(r.Header) && !crypto.S3KMS.IsRequested(r.Header) {
 		r.Header.Add(crypto.SSEHeader, crypto.SSEAlgorithmAES256)
 	}
 
 	actualSize := size
 
+	/*
+	 * 压缩
+	 */
 	if objectAPI.IsCompressionSupported() && isCompressible(r.Header, object) && size > 0 {
 		// Storing the compression metadata.
 		metadata[ReservedMetadataPrefix+"compression"] = compressionAlgorithmV2
@@ -1499,6 +1635,9 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		getObjectInfo = api.CacheAPI().GetObjectInfo
 	}
 
+	/*
+	 * 对象锁
+	 */
 	retentionMode, retentionDate, legalHold, s3Err := checkPutObjectLockAllowed(ctx, r, bucket, object, getObjectInfo, retPerms, holdPerms)
 	if s3Err == ErrNone && retentionMode.Valid() {
 		metadata[strings.ToLower(xhttp.AmzObjectLockMode)] = string(retentionMode)
@@ -1511,6 +1650,10 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL, guessIsBrowserReq(r))
 		return
 	}
+
+	/*
+	 * 复制
+	 */
 	if globalBucketReplicationSys.mustReplicate(ctx, r, bucket, object, metadata, "") {
 		metadata[xhttp.AmzBucketReplicationStatus] = string(replication.Pending)
 	}
@@ -1549,6 +1692,9 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	crypto.RemoveSensitiveEntries(metadata)
 
 	// Create the object..
+	/*
+	 * objInfo 先put ，cache 本地数据盘
+	 */
 	objInfo, err := putObject(ctx, bucket, object, pReader, opts)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL, guessIsBrowserReq(r))
@@ -1574,6 +1720,10 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 			}
 		}
 	}
+
+	/*
+	 * 赋值
+	 */
 	if globalBucketReplicationSys.mustReplicate(ctx, r, bucket, object, metadata, "") {
 		defer replicateObject(ctx, bucket, object, objInfo.VersionID, objectAPI, &eventArgs{
 			EventName:    event.ObjectCreatedPut,
@@ -1585,11 +1735,18 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 			Host:         handlers.GetSourceIP(r),
 		}, false)
 	}
+
+	/*
+	 * 返回结果
+	 */
 	setPutObjHeaders(w, objInfo, false)
 
 	writeSuccessResponseHeadersOnly(w)
 
 	// Notify object created event.
+	/*
+	 * 通知
+	 */
 	sendEvent(eventArgs{
 		EventName:    event.ObjectCreatedPut,
 		BucketName:   bucket,
@@ -1744,10 +1901,17 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL, guessIsBrowserReq(r))
 		return
 	}
+
+	/*
+	 * 不支持 KMS 加密
+	 */
 	if crypto.S3KMS.IsRequested(r.Header) {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r)) // SSE-KMS is not supported
 		return
 	}
+	/*
+	 * EncryptionEnabled 永远返回 true ，初始化阶段固定死
+	 */
 	if !api.EncryptionEnabled() && crypto.IsRequested(r.Header) {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r))
 		return
@@ -1761,6 +1925,9 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		return
 	}
 
+	/*
+	 * 校验逻辑见 HeadObject 部分
+	 */
 	if s3Error := checkRequestAuthType(ctx, r, policy.PutObjectAction, dstBucket, dstObject); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL, guessIsBrowserReq(r))
 		return

@@ -81,6 +81,9 @@ func formatErasureMigrateLocalEndpoints(endpoints Endpoints) error {
 		index := index
 		g.Go(func() error {
 			epPath := endpoints[index].Path
+			/*
+			 * diskpath/.minio.sys/format.json
+			 */
 			formatPath := pathJoin(epPath, minioMetaBucket, formatConfigFile)
 			if _, err := os.Stat(formatPath); err != nil {
 				if os.IsNotExist(err) {
@@ -88,6 +91,9 @@ func formatErasureMigrateLocalEndpoints(endpoints Endpoints) error {
 				}
 				return fmt.Errorf("unable to access (%s) %w", formatPath, err)
 			}
+			/*
+			 * v1 升级到 v2，v2 升级到 v3
+			 */
 			return formatErasureMigrate(epPath)
 		}, index)
 	}
@@ -108,6 +114,13 @@ func formatErasureCleanupTmpLocalEndpoints(endpoints Endpoints) error {
 		}
 		index := index
 		g.Go(func() error {
+			/*
+			 * 1. diskpath/.minio.sys/format.json 不存在则直接返回
+			 * 2. diskpath/.minio.sys/tmp-old，不存在则返回 err
+			 * 3. move diskpath/.minio.sys/tmp to diskpath/.minio.sys/tmp-old/${随机ID}
+			 * 4. rm diskpath/.minio.sys/tmp-old
+			 * 5. mkdir diskpath/.minio.sys/tmp
+			 */
 			epPath := endpoints[index].Path
 			// If disk is not formatted there is nothing to be cleaned up.
 			formatPath := pathJoin(epPath, minioMetaBucket, formatConfigFile)
@@ -230,6 +243,10 @@ func IsServerResolvable(endpoint Endpoint) error {
 // time. additionally make sure to close all the disks used in this attempt.
 func connectLoadInitFormats(retryCount int, firstDisk bool, endpoints Endpoints, zoneCount, setCount, drivesPerSet int, deploymentID string) (storageDisks []StorageAPI, format *formatErasureV3, err error) {
 	// Initialize all storage disks
+	/*
+	 * 1. 如果是本地，则初始化 xlstorage 对象
+	 & 2. 如果是远程，则初始化 xlstorageClient（host:port/diskpath） 对象进行远程交互用
+	 */
 	storageDisks, errs := initStorageDisksWithErrors(endpoints)
 
 	defer func(storageDisks []StorageAPI) {
@@ -350,10 +367,20 @@ func waitForFormatErasure(firstDisk bool, endpoints Endpoints, zoneCount, setCou
 		return nil, nil, errInvalidArgument
 	}
 
+	/*
+	 * 0. 只对 local 的本地磁盘进行处理
+	 * 1. 判断文件 diskpath/.minio.sys/format.json 是否存在
+	 * 2. 如果存在则，进行版本升级，逐级升级直到升级到 V3
+	 */
 	if err := formatErasureMigrateLocalEndpoints(endpoints); err != nil {
 		return nil, nil, err
 	}
 
+	/*
+	 * 1. move diskpath/.minio.sys/tmp to diskpath/.minio.sys/tmp-old/${随机ID}
+	 * 2. rm diskpath/.minio.sys/tmp-old
+	 * 3. mkdir diskpath/.minio.sys/tmp
+	 */
 	if err := formatErasureCleanupTmpLocalEndpoints(endpoints); err != nil {
 		return nil, nil, err
 	}
@@ -372,6 +399,10 @@ func waitForFormatErasure(firstDisk bool, endpoints Endpoints, zoneCount, setCou
 	for {
 		select {
 		case <-ticker.C:
+			/*
+			 * 1. firstDisk 是否第一个 endpoint 是 local
+			 * 2. zoneCount 表示分区的 index 从 1 开始
+			 */
 			storageDisks, format, err := connectLoadInitFormats(tries, firstDisk, endpoints, zoneCount, setCount, drivesPerSet, deploymentID)
 			if err != nil {
 				tries++

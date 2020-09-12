@@ -121,7 +121,7 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 		 * 	1. 要么所有的参数（按空格划分参数）都没有 {...}，要么每一个都得有 {...}
 		 * 	2. 内部创建 endpoints（host:dir） 是会要求所有的 endpoint 类型相同，否则启动失败
 		 * 		2.1 内部调用 HasEllipses 会一次性校验全部的参数，如果多个参数中，有的有 {...}，有的没有，会按没有处理，那么参数的类型（path or url）将不同，启动失败
-		 * 	3. 带有 {...} 时，一个参数视为一个 zone（应该是专门用于扩展集群时的使用模式）
+		 * 	3. 带有 {...} 时，一个参数视为一个 zone（专门用于扩展集群时的使用模式）
 		 * 		3.1 所有的 zone，根据参数计算的 EC 编码块数 和 启动模式（单机、EC、DisEC）必须相同
 		 * 		3.2 如果是以 {...} 方式启动的 DisEC 模式集群
 		 * 			3.2.1 要求节点必须是同构的
@@ -187,30 +187,61 @@ func serverHandleEnvVars() {
 
 func newAllSubsystems() {
 	// Create new notification system and initialize notification targets
+	/*
+ 	 * NotificationSys 主要作用有三个：
+ 	 * 1. 向集群内其他节点发送消息，进行一些权限类的操作
+ 	 * 2. bucket 的通知机制的实现
+  	 * 3. 诊断的接口（应该是 admin 看一些统计信息使用的）
+	 */
 	globalNotificationSys = NewNotificationSys(globalEndpoints)
 
 	// Create new bucket metadata system.
+	/*
+	 * bucket metadata 管理
+	 * 落盘在 /diskpath/.minio.sys./buckets/${Bucket}/*.json、*.xml 等文件
+	 * 内存中会存储在全局变量中，<bucket, bucket_metadata> map中
+	 * 后面很多子系统的配置都是从这里拿出来的
+	 */
 	globalBucketMetadataSys = NewBucketMetadataSys()
 
 	// Create a new config system.
+	/*
+	 * 配置管理，是json 的kv 对
+	 * 从 ~/.minio/config.json to /diskpath/.minio.sys/config/config.json
+	 */
 	globalConfigSys = NewConfigSys()
 
 	// Create new IAM system.
+	/*
+	 * 权限管理
+	 */
 	globalIAMSys = NewIAMSys()
 
 	// Create new policy system.
+	/*
+	 * 访问控制，例如：bucket 粒度的创建、删除等操作是否被允许
+	 */
 	globalPolicySys = NewPolicySys()
 
 	// Create new lifecycle system.
+	/*
+	 * bucket 的生命周期，过期等
+	 */
 	globalLifecycleSys = NewLifecycleSys()
 
 	// Create new bucket encryption subsystem
+	/*
+	 * SSE = Server Side Encryption
+	 */
 	globalBucketSSEConfigSys = NewBucketSSEConfigSys()
 
 	// Create new bucket object lock subsystem
 	globalBucketObjectLockSys = NewBucketObjectLockSys()
 
 	// Create new bucket quota subsystem
+	/*
+	 * 分为 HardQuto、FIFOQuta（配额不够时，walk一遍删除最老的数据）
+	 */
 	globalBucketQuotaSys = NewBucketQuotaSys()
 
 	// Create new bucket versioning subsystem
@@ -220,6 +251,17 @@ func newAllSubsystems() {
 	globalBucketReplicationSys = NewBucketReplicationSys()
 }
 
+/*
+ * 1. 初始化，heal 后端框架（heal_task queue 执行的调度框架）
+ * 2. 本次磁盘 heal（3min 周期检查）
+ * 	2.1 先检查每块磁盘的 format.json 是否异常，不一致之间跳出循环等待下一个 check 周期
+ * 	2.2 如果有异常的磁盘对其上全部的数据进行 heal 检查（调用 healset 接口）
+ * 3. 获取全局锁
+ * 	3.1 为了保证全局锁不过期（默认 2min 过期时间），会周期性的check
+ * 	3.2 获取全局锁失败，则重试，目的是保证所有的节点顺序的执行下面的逻辑
+ * 4. 加密配置生成，无限重试等待成功
+ * 5. 初始化全部的子系统
+ */
 func initSafeMode(ctx context.Context, newObject ObjectLayer) (err error) {
 	// Create cancel context to control 'newRetryTimer' go routine.
 	retryCtx, cancel := context.WithCancel(ctx)
@@ -232,6 +274,9 @@ func initSafeMode(ctx context.Context, newObject ObjectLayer) (err error) {
 	// at a given time, this big transaction lock ensures this
 	// appropriately. This is also true for rotation of encrypted
 	// content.
+	/*
+	 * /diskpath/.minio.sys/config/transaction.lock
+	 */
 	txnLk := newObject.NewNSLock(retryCtx, minioMetaBucket, minioConfigPrefix+"/transaction.lock")
 	defer func(txnLk RWLocker) {
 		txnLk.Unlock()
@@ -337,6 +382,9 @@ func initAllSubsystems(ctx context.Context, newObject ObjectLayer) (err error) {
 	var buckets []BucketInfo
 	if globalIsDistErasure || globalIsErasure {
 		// List buckets to heal, and be re-used for loading configs.
+		/*
+		 * 遍历所有的 zone、set、disk 获取bucket 并且 一个set 内去重
+		 */
 		buckets, err = newObject.ListBucketsHeal(ctx)
 		if err != nil {
 			return fmt.Errorf("Unable to list buckets to heal: %w", err)
@@ -346,6 +394,10 @@ func initAllSubsystems(ctx context.Context, newObject ObjectLayer) (err error) {
 		wquorum := &InsufficientWriteQuorum{}
 		rquorum := &InsufficientReadQuorum{}
 		for _, bucket := range buckets {
+			/*
+			 * 对于有的磁盘上 bucket 缺失的进行 makevol
+			 * 并且生成器 meta 并持久化
+			 */
 			if err = newObject.MakeBucketWithLocation(ctx, bucket.Name, BucketOptions{}); err != nil {
 				if errors.As(err, &wquorum) || errors.As(err, &rquorum) {
 					// Return the error upwards for the caller to retry.
@@ -394,12 +446,21 @@ func initAllSubsystems(ctx context.Context, newObject ObjectLayer) (err error) {
 	return nil
 }
 
+/*
+ * 1. 数据副本修复
+ * 2. 数据统计
+ *
+ * 注意：全局唯一，只有leader 能够做这个事情
+ */
 func startBackgroundOps(ctx context.Context, objAPI ObjectLayer) {
 	// Make sure only 1 crawler is running on the cluster.
 	locker := objAPI.NewNSLock(ctx, minioMetaBucket, "leader")
 	for {
 		err := locker.GetLock(leaderLockTimeout)
 		if err != nil {
+			/*
+			 * 1 hour 
+			 */
 			time.Sleep(leaderLockTimeoutSleepInterval)
 			continue
 		}
@@ -415,6 +476,104 @@ func startBackgroundOps(ctx context.Context, objAPI ObjectLayer) {
 }
 
 // serverMain handler called for 'minio server' command.
+/*
+ * 总结：
+ * 	1. 参数解析
+ * 	2. http handler 注册，与 http server 启动
+ * 	3. 子系统初始化，并且赋值给全局变量	
+ * 
+ * 具体：
+ * 1. 参数解析 && 全局变量初始化
+ * 	1.1 主要是 Endpoints（Host:Dir）解析
+ * 		1.1.1 zone、set、EC编码分块数量等解析与计算
+ * 	1.2 环境变量中的配置将会覆盖之前的参数配置值
+ * 2. 在线升级程序检查、系统资源设置（内存、fd等）
+ * 3. Heal 全局变量生成
+ * 	3.1 globalAllHealState
+ * 		admin 中 HealHandler 接口使用的 heal 变量
+ * 	3.2 globalBackgroundHealState
+ * 		全局后台运行的 heal 模块
+ * 	3.3 allHealState
+ * 		上述两个变量，都是 allHealState 系统的实例化
+ * 		3.3.1 allHealState 内部维护一个路径 与 heal_task 的map
+ * 		3.3.2 协理机制
+ *			内部启动一个协程周期（5min）检查map 内所有的任务是否结束或者停止，是的话从map中清除
+ * 		3.3.3 加入机制
+ * 			3.3.3.1 task_task 是结构 healSequence
+ * 			3.3.3.2 LaunchNewHealSequence 接口负责检验（是否存在等），加入map，然后启动相应的 heal_task
+ * 		3.3.4 读取、停止等机制（有接口能够进行查询和控制）
+ * 4. http 接口回调的注册（内部分很多类型），并启动 http 服务
+ * 	纵向串联起所有的子模块，后续详细介绍内部逻辑
+ * 5. newObjectLayer 初始化
+ * 		newObjectLayer 是 zone、set、object 的抽象
+ * 		逐层调用（zone、set、object），最后调用 xlstorage 的接口完成数据真正的读写
+ * 		xlstorage 抽象为 disk，分位本地磁盘和远程磁盘客户端两种，完成本地和分布式的磁盘操作
+ * 		xlstorage 是直接 IO，提升性能
+ * 6. 生成所有的子系统对象（全局变量）， newAllSubsystems
+ * 		globalNotificationSys
+ * 		  BucketMetadata 的配置之一
+ * 			1. 向集群内其他节点发送消息，进行一些权限类的操作
+ *			2. bucket 的通知机制的实现（删除更新）
+ * 			3. 诊断的接口（应该是 admin 看一些统计信息使用的，内存，磁盘等）
+ * 		globalBucketMetadataSys
+ * 			1. bucket metadata 管理
+ * 			2. 落盘在 /diskpath/.minio.sys./buckets/${Bucket}/*.json、*.xml 等文件
+ * 				十多个元数据文件，与后面很对的子系统相对应
+ * 			3. 内存中会存储在全局变量中，<bucket, bucket_metadata> map中
+ ******************************************************************
+ * 		globalConfigSys
+ * 			1. 对应的文件：/diskpath/.minio.sys/config/config.json
+ * 			2. 配置管理，是json 的kv 对
+ * 		globalIAMSys
+ * 			权限管理模块
+ * 		注意：只有这两个子系统的配置不在 BucketMetadata 中
+ ******************************************************************
+ * 		globalPolicySys
+ * 		  BucketMetadata 的配置之一
+ *			访问控制，例如：bucket 粒度的创建、删除等操作是否被允许
+ * 		globalLifecycleSys
+ *        BucketMetadata 的配置之一
+ * 			bucket 的生命周期，过期等
+ * 		globalBucketSSEConfigSys
+ * 		  BucketMetadata 的配置之一
+ * 			SSE = Server Side Encryption
+ * 		globalBucketObjectLockSys
+ * 	      BucketMetadata 的配置之一
+ * 			userDefine 的 metadata 部分
+ * 			主要是兼容 S3 语义，自定一些对象是否可删除的配置，内部兼容S3的校验逻辑
+ * 		globalBucketQuotaSys
+ *   	  BucketMetadata 的配置之一
+ * 			分为 HardQuto、FIFOQuta（配额不够时，walk一遍删除最老的数据
+ * 		globalBucketVersioningSys
+ * 		  BucketMetadata 的配置之一
+ * 			一种类似 leveldb 的 mainfest 管理机制
+ * 			每一种配置的变更都是向源文件中追加修改记录
+ * 			globalBucketMetadataSys 判断当前 version 的状态是 enable 还是 suspend
+ * 		globalBucketReplicationSys
+ * 		  BucketMetadata 的配置之一
+ * 			应该是根据配置进行副本写的写入
+ * 			内部很多兼容 S3 的语义
+ * 7. 启动 background 任务， startBackgroundOps
+ * 	注意： startBackgroundOps 只有集群 leader 能够执行该部分逻辑
+ * 		7.1 数据副本修复
+ * 			启动 globalBackgroundHealState 后台任务
+ * 		7.2 DataUsage（目录关系组织的对象大小、磁盘大小等统计信息） 数据统计
+ *			7.2.1 落盘 /diskpath/.minio.sys/buckets/.usage.json
+ *			7.2.2 周期性的更新 boolmfilter
+ * 8. 所有节点顺序安全的初始化：子系统 ， initSafeMode
+ * 		8.1 初始化，heal 后端框架（heal_task queue 执行的调度框架）
+ * 		8.2 本次磁盘 heal（3min 周期检查）
+ * 			8.2.1 先检查每块磁盘的 format.json 是否异常，不一致之间跳出循环等待下一个 check 周期
+ * 			8.2.2 如果有异常的磁盘对其上全部的数据进行 heal 检查（调用 healset 接口）
+ * 		8.3 分布式锁保证所有节点顺序执行，并且一定执行
+ * 			8.3.1 加密配置生成，无限重试等待成功
+ * 			8.3.2 初始化全部的子系统
+ * 		注意：
+ * 			为了保证全局锁不过期（默认 2min 过期时间），会周期性的check
+ * 			获取全局锁失败，则重试，目的是保证所有的节点顺序的执行下面的逻辑
+ * 9. 初始化权限系统， startBackgroundIAMLoad
+ * 10. 初始化 disk cache for object， newServerCacheObjects
+ */
 func serverMain(ctx *cli.Context) {
 	if ctx.Args().First() == "help" || !endpointsPresent(ctx) {
 		cli.ShowCommandHelpAndExit(ctx, "server", 1)
@@ -447,6 +606,9 @@ func serverMain(ctx *cli.Context) {
 	globalRootCAs, err = config.GetRootCAs(globalCertsCADir.Get())
 	logger.FatalIf(err, "Failed to read root CAs (%v)", err)
 
+	/*
+	 * endpoint 中的节点，去重同一个 host 上面多个目录的重复，组成新的数据结构 []ProxyEndpoint
+	 */
 	globalProxyEndpoints, err = GetProxyEndpoints(globalEndpoints)
 	logger.FatalIf(err, "Invalid command line arguments")
 
@@ -470,6 +632,9 @@ func serverMain(ctx *cli.Context) {
 
 	if !globalCLIContext.Quiet {
 		// Check for new updates from dl.min.io.
+		/*
+		 * 从官网查看是否需要更新程序，如果需要的话会打印一条日志输出到控制台
+		 */
 		checkUpdate(getMinioMode())
 	}
 
@@ -488,6 +653,9 @@ func serverMain(ctx *cli.Context) {
 	}
 
 	// Configure server.
+	/*
+	 * 各种 http api 注册，重要的是 S3 接口 
+	 */
 	handler, err := configureServerHandler(globalEndpoints)
 	if err != nil {
 		logger.Fatal(config.ErrUnexpectedError(err), "Unable to configure one of server's RPC services")

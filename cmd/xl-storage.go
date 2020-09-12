@@ -86,20 +86,20 @@ func isValidVolname(volname string) bool {
 
 // xlStorage - implements StorageAPI interface.
 type xlStorage struct {
-	maxActiveIOCount int32
-	activeIOCount    int32
+	maxActiveIOCount int32  	// 操作磁盘的并发度最大值
+	activeIOCount    int32 		// 操作磁盘的并发度 
 
-	diskPath string
-	hostname string
-
+	diskPath string 			// 磁盘路径
+	hostname string 			// host 地址
+ 
 	pool sync.Pool
 
-	diskMount bool // indicates if the path is an actual mount.
+	diskMount bool 				// indicates if the path is an actual mount.
 
-	diskID string
+	diskID string 				// 缓存中的disk uuid
 
-	formatFileInfo  os.FileInfo
-	formatLastCheck time.Time
+	formatFileInfo  os.FileInfo // diskPath/.minio.sys/format.json 文件
+	formatLastCheck time.Time 	// 
 
 	ctx context.Context
 	sync.RWMutex
@@ -145,6 +145,12 @@ func checkPathLength(pathName string) error {
 	return nil
 }
 
+/*
+ * 1. 转换为绝对路径
+ * 2. 不存在则创建
+ * 3. 总容量 * 0.95 > 900 MiB
+ * 4. 创建一个临时文件 ".writable-check-"+hex.EncodeToString(rnd[:])+".tmp" ，测试一下权限、是否可以使用直接IO 等，最后要删除
+ */
 func getValidPath(path string, requireDirectIO bool) (string, error) {
 	if path == "" {
 		return path, errInvalidArgument
@@ -232,6 +238,10 @@ func isDirEmpty(dirname string) bool {
 // Initialize a new storage disk.
 func newXLStorage(path string, hostname string) (*xlStorage, error) {
 	var err error
+	/*
+	 * 1. 转换为了绝对路径
+	 * 2. 做了一些列校验（空间大小、权限）
+	 */
 	if path, err = getValidPath(path, true); err != nil {
 		return nil, err
 	}
@@ -239,12 +249,18 @@ func newXLStorage(path string, hostname string) (*xlStorage, error) {
 	p := &xlStorage{
 		diskPath: path,
 		hostname: hostname,
+		/*
+		 * 直接 IO 操作的 内存块，默认代销是 4 MiB
+		 */
 		pool: sync.Pool{
 			New: func() interface{} {
 				b := disk.AlignedBlock(readBlockSize)
 				return &b
 			},
 		},
+		/*
+		 * 判断目录是不是一个单独的挂载点
+		 */
 		diskMount: mountinfo.IsLikelyMountPoint(path),
 		// Allow disk usage crawler to run with up to 2 concurrent
 		// I/O ops, if and when activeIOCount reaches this
@@ -355,9 +371,19 @@ func (s *xlStorage) IsLocal() bool {
 	return true
 }
 
+/*
+ * 正在运行的 Crawl 任务不能超过 3（并发度）
+ * 超过的话，需要等 1s，100ms 检查一次并发度是否小于等于 3
+ */
 func (s *xlStorage) waitForLowActiveIO() {
-	max := lowActiveIOWaitMaxN
+	/*
+	 * lowActiveIOWaitMaxN == 10
+	 */
+	max := lowActiveIOWaitMaxN  
 	for atomic.LoadInt32(&s.activeIOCount) >= s.maxActiveIOCount {
+		/*
+		 * lowActiveIOWaitTick == 100 ms
+		 */
 		time.Sleep(lowActiveIOWaitTick)
 		max--
 		if max == 0 {
@@ -369,8 +395,16 @@ func (s *xlStorage) waitForLowActiveIO() {
 	}
 }
 
+/*
+ * 1. http 接口支持用户调用
+ * 2. 5min 周期任务调用一次
+ */
 func (s *xlStorage) CrawlAndGetDataUsage(ctx context.Context, cache dataUsageCache) (dataUsageCache, error) {
 	// Check if the current bucket has a configured lifecycle policy
+	/*
+	 * 从 bucket 配置中获取 Lifecycle 的配置
+	 * 前缀为空，且递归的查找规则，有则返回 true
+	 */
 	lc, err := globalLifecycleSys.Get(cache.Info.Name)
 	if err == nil && lc.HasActiveRules("", true) {
 		cache.Info.lifeCycle = lc
@@ -384,6 +418,9 @@ func (s *xlStorage) CrawlAndGetDataUsage(ctx context.Context, cache dataUsageCac
 
 	dataUsageInfo, err := crawlDataFolder(ctx, s.diskPath, cache, s.waitForLowActiveIO, func(item crawlItem) (int64, error) {
 		// Look for `xl.meta/xl.json' at the leaf.
+		/* 
+		 * /xl.meta 或 /xl.json 必须得有
+		 */
 		if !strings.HasSuffix(item.Path, SlashSeparator+xlStorageFormatFile) &&
 			!strings.HasSuffix(item.Path, SlashSeparator+xlStorageFormatFileV1) {
 			// if no xl.meta/xl.json found, skip the file.
@@ -396,8 +433,39 @@ func (s *xlStorage) CrawlAndGetDataUsage(ctx context.Context, cache dataUsageCac
 		}
 
 		// Remove filename which is the meta file.
+		/*
+		 * 对 crawlItem 内成员变量 prefix 和 objectName 赋值
+		 */
 		item.transformMetaDir()
 
+		/*
+		 * 目录结构：
+		 * disk1/
+		 * └── bucket
+		 *     └── object
+		 *         ├── a192c1d5-9bd5-41fd-9a90-ab10e165398d
+		 *         │   └── part.1
+		 *         ├── c06e0436-f813-447e-ae5e-f2564df9dfd4
+		 *         │   └── part.1
+		 *         ├── df433928-2dcf-47b1-a786-43efa0f6b424
+		 *         │   └── part.1
+		 *         ├── legacy
+		 *         │   └── part.1
+		 *         └── xl.meta
+		 *
+		 * meta 记录每一个文件的变化，类似 leveldb
+		 * getFileInfoVersions 遍历 xl.meta 文件，将文件的元数据加载起来，内部数据分三种类型
+		 * ObjectType（新版本的更新）、DeleteType（删除）、LegacyType（旧版本的更新）
+		 * 
+		 * 遍历之后生成如下的数据结构，主要是 Versions
+		 * FileInfoVersions{
+		 * 		Volume:        volume,
+		 *		Name:          path,
+		 *		Versions:      versions,
+		 *		LatestModTime: latestModTime,
+		 * }
+		 * 
+		 */
 		fivs, err := getFileInfoVersions(buf, item.bucket, item.objectPath())
 		if err != nil {
 			return 0, errSkipFile
@@ -405,6 +473,10 @@ func (s *xlStorage) CrawlAndGetDataUsage(ctx context.Context, cache dataUsageCac
 
 		var totalSize int64
 		for _, version := range fivs.Versions {
+			/*
+			 * 获取 object 的真实大小
+			 * 对于确认删除的 objet 进行删除（删除有一个二次确认的逻辑，需要与写和删除的逻辑一期看）
+			 */
 			size := item.applyActions(ctx, objAPI, actionMeta{
 				numVersions: len(fivs.Versions),
 				oi:          version.ToObjectInfo(item.bucket, item.objectPath()),
@@ -415,6 +487,9 @@ func (s *xlStorage) CrawlAndGetDataUsage(ctx context.Context, cache dataUsageCac
 		}
 
 		for _, version := range fivs.Versions {
+			/*
+			 * 对于正在同步的数据、或者同步失败的数据，重新同步一次（副本间）
+			 */
 			item.healReplication(ctx, objAPI, actionMeta{oi: version.ToObjectInfo(item.bucket, item.objectPath())})
 		}
 		return totalSize, nil
@@ -454,6 +529,9 @@ func (s *xlStorage) DiskInfo() (info DiskInfo, err error) {
 		return info, err
 	}
 
+	/*
+	 * 是否是 "/" 目录
+	 */
 	rootDisk, err := disk.IsRootDisk(s.diskPath)
 	if err != nil {
 		return info, err
@@ -485,6 +563,11 @@ func (s *xlStorage) getVolDir(volume string) (string, error) {
 }
 
 // GetDiskID - returns the cached disk uuid
+/*
+ * 1. 刚更新没有超过 1s，则返回 s.diskID
+ * 2. 之前更新的时间没有变化，则返回 s.diskID
+ * 3. 从 diskPath/.minio.sys/format.json 读取 format.Erasure.This 赋值给 s.diskID 返回
+ */
 func (s *xlStorage) GetDiskID() (string, error) {
 	s.RLock()
 	diskID := s.diskID
@@ -505,6 +588,10 @@ func (s *xlStorage) GetDiskID() (string, error) {
 		// Somebody else got the lock first.
 		return diskID, nil
 	}
+	/*
+	 * formatConfigFile == "format.json"
+	 * minioMetaBucket == ".minio.sys"
+	 */
 	formatFile := pathJoin(s.diskPath, minioMetaBucket, formatConfigFile)
 	fi, err := os.Stat(formatFile)
 	if err != nil {
@@ -564,7 +651,13 @@ func (s *xlStorage) MakeVolBulk(volumes ...string) (err error) {
 }
 
 // Make a volume entry.
+/*
+ * 创建 diskpath/volume 
+ */
 func (s *xlStorage) MakeVol(volume string) (err error) {
+	/*
+	 * 长度超过 3
+	 */
 	if !isValidVolname(volume) {
 		return errInvalidArgument
 	}
@@ -574,6 +667,9 @@ func (s *xlStorage) MakeVol(volume string) (err error) {
 		atomic.AddInt32(&s.activeIOCount, -1)
 	}()
 
+	/*
+	 * diskpath/volume
+	 */
 	volumeDir, err := s.getVolDir(volume)
 	if err != nil {
 		return err
@@ -614,7 +710,7 @@ func (s *xlStorage) ListVols() (volsInfo []VolInfo, err error) {
 	for i, vol := range volsInfo {
 		volInfo := VolInfo{
 			Name:    vol.Name,
-			Created: vol.Created,
+			Created: vol.Created, 		// 最后一次更新的时间
 		}
 		volsInfo[i] = volInfo
 	}
@@ -729,6 +825,12 @@ const guidSplunk = "guidSplunk"
 
 // ListDirSplunk - return all the entries at the given directory path.
 // If an entry is a directory it will be returned with a trailing SlashSeparator.
+/*
+ * 1. dirPath 必须包含 "guidSplunk"
+ * 2. volumeDir/dirPath 目录下面的内容进行扫表
+ * 3. volumeDir/dirPathreceipt.json/xl.meta 进行处理，去掉"/"后缀
+ * 4. 返回 volumeDir/dirPath 目录下的内容字符串
+ */
 func (s *xlStorage) ListDirSplunk(volume, dirPath string, count int) (entries []string, err error) {
 	guidIndex := strings.Index(dirPath, guidSplunk)
 	if guidIndex != -1 {
@@ -771,12 +873,18 @@ func (s *xlStorage) ListDirSplunk(volume, dirPath string, count int) (entries []
 		if entry != receiptJSON {
 			continue
 		}
+		/*
+		 * volumeDir/dirPath/entry/xl.meta
+		 */
 		_, err = os.Stat(pathJoin(dirPathAbs, entry, xlStorageFormatFile))
 		if err == nil {
 			entries[i] = strings.TrimSuffix(entry, SlashSeparator)
 			continue
 		}
 		if os.IsNotExist(err) {
+			/*
+			 * 
+			 */
 			if err = s.renameLegacyMetadata(volume, pathJoin(dirPath, entry)); err == nil {
 				// Rename was successful means we found old `xl.json`
 				entries[i] = strings.TrimSuffix(entry, SlashSeparator)
@@ -812,6 +920,9 @@ func (s *xlStorage) WalkSplunk(volume, dirPath, marker string, endWalkCh <-chan 
 	ch = make(chan FileInfo)
 	go func() {
 		defer close(ch)
+		/*
+		 * volume/dirPath 目录下包含前缀 dirEntry 的子项
+		 */
 		listDir := func(volume, dirPath, dirEntry string) (bool, []string) {
 			entries, err := s.ListDirSplunk(volume, dirPath, -1)
 			if err != nil {

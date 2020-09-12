@@ -120,6 +120,9 @@ func (c *cacheObjects) updateMetadataIfChanged(ctx context.Context, dcache *disk
 }
 
 // DeleteObject clears cache entry if backend delete operation succeeds
+/*
+ * 1. 先删除磁盘再删除 cache
+ */
 func (c *cacheObjects) DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
 	if objInfo, err = c.DeleteObjectFn(ctx, bucket, object, opts); err != nil {
 		return
@@ -187,6 +190,10 @@ func (c *cacheObjects) incCacheStats(size int64) {
 	c.cacheStats.incBytesServed(size)
 }
 
+/*
+ * for mutilpy put 
+ * 如果不在 cache 会put 到 cache 中
+ */
 func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error) {
 	if c.isCacheExclude(bucket, object) || c.skipCache() {
 		return c.GetObjectNInfoFn(ctx, bucket, object, rs, h, lockType, opts)
@@ -348,6 +355,13 @@ func (c *cacheObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 }
 
 // Returns ObjectInfo from cache if available.
+/*
+ * 1. 是否在 cache 的 exclude 里面
+ * 2. 如 put 获取 cache 磁盘位置，通过 state 接口获取 cachedObjInfo
+ * 3. 根据 cachedObjInfo 判断是否过期，没有则返回 cachedObjInfo
+ * 4. 到此，cache 没有命中，调用 zone 的接口
+ * 注意：cache 的统计信息的更新
+ */
 func (c *cacheObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
 	getObjectInfoFn := c.GetObjectInfoFn
 
@@ -406,6 +420,11 @@ func (c *cacheObjects) GetObjectInfo(ctx context.Context, bucket, object string,
 }
 
 // CopyObject reverts to backend after evicting any stale cache entries
+/*
+ * 1. 是否在 cache 的 exclude 目录、不是原地copy（原地copy会更新元数据），直接调用 zone 的 copy 接口
+ * 2. 如果是原地 copy，根据 user_define 的 cache 策略决定是否过期，没有cache策略或者过期则删除cache
+ * 3. 进行原地 copy
+ */
 func (c *cacheObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error) {
 	copyObjectFn := c.CopyObjectFn
 	if c.isCacheExclude(srcBucket, srcObject) || c.skipCache() {
@@ -531,19 +550,96 @@ func (c *cacheObjects) hashIndex(bucket, object string) int {
 
 // newCache initializes the cacheFSObjects for the "drives" specified in config.json
 // or the global env overrides.
+/*
+ * 参数：
+ * 	type Config struct {
+ *		Enabled       bool    
+ *		Drives        []string  // 需要cache的磁盘
+ *		Expiry        int      
+ *		MaxUse        int      
+ *		Quota         int      
+ *		Exclude       []string 
+ *		After         int      
+ *		WatermarkLow  int      
+ *		WatermarkHigh int      
+ *		Range         bool     
+ *	}
+ *
+ * 返回值
+ *	 type diskCache struct {
+ *		online       uint32 	// 1 代表在线，0 代表下线
+ *		purgeRunning int32 		// 是否在 gc
+ *
+ *		triggerGC     chan struct{} 	// 触发 gc 的通信管道
+ *		dir           string         	// caching directory
+ *
+ *		stats         CacheDiskStats 	// disk cache stats for prometheus
+ *	 		type CacheDiskStats struct {
+ *				UsageState int32 		// high value is '1', low its '0'
+ *				UsagePercent uint64
+ *				Dir          string
+ *			}
+ * 			// high >= quotaPct * highWatermark ? true : false
+ *			// low  <= quotaPct * lowWatermark ? true : false
+ *
+ *		quotaPct      int           // 缓存容量 = quotaPct * 磁盘容量
+ *		pool          sync.Pool 	// 4K 的内存空间对象，与直接IO大小对应
+ *		after         int 			// 应该是被访问了 after 次之后，才进行cache
+ *		lowWatermark  int 			// gc 的停止点 quotaPct * lowWatermark
+ *		highWatermark int 			// 最大空间 quotaPct * highWatermark
+ *		enableRange   bool 			// 是否支持 分片cache
+ *		nsMutex *nsLockMap 			// 分布式锁，下面是回调
+ *		NewNSLockFn func(ctx context.Context, cachePath string) RWLocker
+ *	}
+ */
 func newCache(config cache.Config) ([]*diskCache, bool, error) {
 	var caches []*diskCache
 	ctx := logger.SetReqInfo(GlobalContext, &logger.ReqInfo{})
+	/*
+	 * 注意： 
+	 * 	1. formatCacheV2 与 formatErasureV3 是不同的结构体，内部都继承 formatMetaV1
+	 * 	2. 后者是 newObjectLayer 时初始化并保存的 
+	 * 
+	 * type formatCacheV2 = formatCacheV1
+	 * type formatCacheV1 struct {
+	 *		formatMetaV1
+	 *		type formatMetaV1 struct {
+	 *			Version string 	// Version of the format config
+	 *			Format string 	// backend format type, we force to xl
+	 *			ID string 		// deployment id 
+	 *		}
+	 *		Cache struct {
+	 *			Version string 	// Version of 'cache' format.
+	 *			This    string 	// disk uuid.
+	 *			Disks []string 	// input disk order generated the first time when fresh disks were supplied.
+	 *			DistributionAlgo string 	// hashing algorithm
+	 *		} 		// Cache field holds cache format.
+	 *	}
+	 *
+	 * loadAndValidateCacheFormat 从 /diskpath/.minio.sys/format.json 里面读取
+	 * 一块磁盘对应一个 format
+	 * migrating 标识 format.json 是否进行升级搞得版本
+	 *
+	 * loadAndValidateCacheFormat 内部只对本节点进行了加载 format.json
+	 * 应该是只 cache 了本地磁盘的数据，为什么用 cache 呢？直接读数据效果不也是一样的吗？都是直接IO
+	 * 难道是考虑，磁盘介质提升 cache 性能？
+	 */
 	formats, migrating, err := loadAndValidateCacheFormat(ctx, config.Drives)
 	if err != nil {
 		return nil, false, err
 	}
 	for i, dir := range config.Drives {
 		// skip diskCache creation for cache drives missing a format.json
+		/*
+		 * 只对 foemat.json 的磁盘，既正常的磁盘进行 cache
+		 */
 		if formats[i] == nil {
 			caches = append(caches, nil)
 			continue
 		}
+		/*
+		 * 判断系统是否支持访问次数查询
+		 */
 		if err := checkAtimeSupport(dir); err != nil {
 			return nil, false, errors.New("Atime support required for disk caching")
 		}
@@ -593,11 +689,34 @@ func (c *cacheObjects) migrateCacheFromV1toV2(ctx context.Context) {
 }
 
 // PutObject - caches the uploaded object for single Put operations
+/*
+ * 1. 获取cache disk
+ * 	1.1 index = crchash(bucket/object) / len(diskcaches)
+ * 	1.2 从 index 开始之后开始找，知道找到 object 在那个 disk ，直接返回
+ * 	1.3 没有找到，则是从index 开始第一个 online 的disk
+ * 2. formate 升级ing、cache 磁盘容量不够、需要 SSE、S3语义层带有锁、cache exclude目录
+ * 		上述情况都不会写入cache，直接写入走 zone 的接口进行写
+ * 3. 经过上述约束检查之后，同步写入数据磁盘，然后异步写入 cache
+ *
+ * 注意：
+ * 	0. cache 的数据是 objectinfo，而不是用户的数据
+ * 	1. cache 目录不与数据目录一一对应
+ * 	2. cache 是 write through 方式
+ * 	3. cache 与 data 磁盘应该是利用介质不同，提升读性能，不是内存cache
+ */
 func (c *cacheObjects) PutObject(ctx context.Context, bucket, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
 	putObjectFn := c.PutObjectFn
+	/*
+	 * 1. index = crchash(bucket/object) / len(diskcaches)
+	 * 2. 从 index 开始之后开始找，知道找到 object 在那个 disk ，直接返回
+	 * 3. 没有找到，则是从index 开始第一个 online 的disk
+	 */
 	dcache, err := c.getCacheToLoc(ctx, bucket, object)
 	if err != nil {
 		// disk cache could not be located,execute backend call.
+		/*
+		 * 直接写数据目录
+		 */
 		return putObjectFn(ctx, bucket, object, r, opts)
 	}
 	size := r.Size()
@@ -609,6 +728,10 @@ func (c *cacheObjects) PutObject(ctx context.Context, bucket, object string, r *
 	if !dcache.diskAvailable(size) {
 		return putObjectFn(ctx, bucket, object, r, opts)
 	}
+
+	/*
+	 * cache 不进行加密
+	 */
 	if opts.ServerSideEncryption != nil {
 		dcache.Delete(ctx, bucket, object)
 		return putObjectFn(ctx, bucket, object, r, opts)
@@ -629,6 +752,10 @@ func (c *cacheObjects) PutObject(ctx context.Context, bucket, object string, r *
 		return putObjectFn(ctx, bucket, object, r, opts)
 	}
 
+	/*
+	 * write through 方式，先写入磁盘，在写入缓存，缓存完全是为了 get 
+	 * 写入磁盘算成功，异步写入cache
+	 */
 	objInfo, err = putObjectFn(ctx, bucket, object, r, opts)
 
 	if err == nil {
@@ -652,6 +779,45 @@ func (c *cacheObjects) PutObject(ctx context.Context, bucket, object string, r *
 }
 
 // Returns cacheObjects for use by Server.
+/*
+ * 参数：
+ * 	type Config struct {
+ *		Enabled       bool    
+ *		Drives        []string 
+ *		Expiry        int      
+ *		MaxUse        int      
+ *		Quota         int      
+ *		Exclude       []string 
+ *		After         int      
+ *		WatermarkLow  int      
+ *		WatermarkHigh int      
+ *		Range         bool     
+ *	}
+ *
+ * 返回值：
+ * 	type cacheObjects struct {
+ *		cache []*diskCache 	// cache 的磁盘，或者说路径
+ *		exclude []string 	// 不被cache 的路径
+ *		after int 			// 访问到一定次数之后才进行cache
+ *		migrating bool 		// 元数据是否需要升级的标志位
+ *		migMutex sync.Mutex
+ *
+ *		cacheStats *CacheStats
+ *			type CacheStats struct {
+ *				BytesServed  uint64 	// cache 的大小
+ *				Hits         uint64 	// 命中次数
+ *				Misses       uint64 	// 未命中技术
+ *				GetDiskStats func() []CacheDiskStats 	// 针对磁盘的统计
+ *					type CacheDiskStats struct {
+ *						UsageState int32 		// high value is '1', low its '0'
+ *						UsagePercent uint64
+ *						Dir          string
+ *					}
+ *					// high >= quotaPct * highWatermark ? true : false
+ *					// low  <= quotaPct * lowWatermark ? true : false
+ *			}
+ *	}
+ */
 func newServerCacheObjects(ctx context.Context, config cache.Config) (CacheObjectLayer, error) {
 	// list of disk caches for cache "drives" specified in config.json or MINIO_CACHE_DRIVES env var.
 	cache, migrateSw, err := newCache(config)
@@ -701,7 +867,14 @@ func newServerCacheObjects(ctx context.Context, config cache.Config) (CacheObjec
 	return c, nil
 }
 
+/*
+ * 1. 30min 遍历所有的磁盘进行gc，详细逻辑见 diskcache purg
+ * 2. 另一种触发单盘 gc 的场景是，put 数据的时候超过 pct * high_water
+ */
 func (c *cacheObjects) gc(ctx context.Context) {
+	/*
+	 * 30 min 
+	 */
 	ticker := time.NewTicker(cacheGCInterval)
 
 	defer ticker.Stop()
@@ -713,6 +886,9 @@ func (c *cacheObjects) gc(ctx context.Context) {
 			if c.migrating {
 				continue
 			}
+			/*
+			 * 逐个磁盘遍历完成 gc
+			 */
 			for _, dcache := range c.cache {
 				if dcache != nil {
 					dcache.triggerGC <- struct{}{}

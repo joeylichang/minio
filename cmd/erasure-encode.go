@@ -90,6 +90,9 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 			break
 		}
 		// We take care of the situation where if n == 0 and total == 0 by creating empty data and parity files.
+		/*
+		 * EC 编码之后的 二维数组 [][]byte
+		 */
 		blocks, err = e.EncodeData(ctx, buf[:n])
 		if err != nil {
 			logger.LogIf(ctx, err)

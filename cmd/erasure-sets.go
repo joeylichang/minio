@@ -51,39 +51,39 @@ type diskConnectInfo struct {
 type erasureSets struct {
 	GatewayUnsupported
 
-	sets []*erasureObjects
+	sets []*erasureObjects 						// 一个 EC 分组对应一个 erasureObjects
 
 	// Reference format.
-	format *formatErasureV3
+	format *formatErasureV3 					// 当前 zone 中某一个 disk 的 format，但是This 被设置为 “”
 
 	// erasureDisks mutex to lock erasureDisks.
-	erasureDisksMu sync.RWMutex
+	erasureDisksMu sync.RWMutex 				//  disk（erasureDisks） 数据操作的锁
 
 	// Re-ordered list of disks per set.
-	erasureDisks [][]StorageAPI
+	erasureDisks [][]StorageAPI 				// 当前zone内部，每个磁盘的操作对象，xlstorage（本地） 或者 xlstorageClient（远程）
 
 	// Distributed locker clients.
-	erasureLockers setsDsyncLockers
+	erasureLockers setsDsyncLockers 			// 每个节点的分布式锁对象，一个 disk 对应一个
 
 	// List of endpoints provided on the command line.
-	endpoints Endpoints
+	endpoints Endpoints 						// 当前 zone 内全部的 host：dir
 
 	// String version of all the endpoints, an optimization
 	// to avoid url.String() conversion taking CPU on
 	// large disk setups.
-	endpointStrings []string
+	endpointStrings []string 					// 所有 Endpoints 对应的 diskpath
 
 	// Total number of sets and the number of disks per set.
-	setCount, drivesPerSet int
+	setCount, drivesPerSet int 					// EC 分组数，EC内部的分块数量
 
-	disksConnectEvent chan diskConnectInfo
+	disksConnectEvent chan diskConnectInfo 		// disk 重连之后会将在zone内的 index 传入进去，用于对应项该disk 上述数据的 heal（应该是重写）
 
 	// Done channel to control monitoring loop.
 	disksConnectDoneCh chan struct{}
 
 	// Distribution algorithm of choice.
-	distributionAlgo string
-	deploymentID     [16]byte
+	distributionAlgo string 					// hash 算法
+	deploymentID     [16]byte 					// 是上层 pick 的那个 format.id ，所有的disk 都一样
 
 	disksStorageInfoCache timedValue
 
@@ -93,9 +93,12 @@ type erasureSets struct {
 	poolVersions *MergeWalkVersionsPool
 
 	mrfMU         sync.Mutex
-	mrfOperations map[healSource]int
+	mrfOperations map[healSource]int 			// 记录写入或者删除 整体操作成功，但是部分 EC 分块失败的信息
 }
 
+/*
+ * 总是返回 true
+ */
 func isEndpointConnected(diskMap map[string]StorageAPI, endpoint string) bool {
 	disk := diskMap[endpoint]
 	if disk == nil {
@@ -292,28 +295,31 @@ func newErasureSets(ctx context.Context, endpoints Endpoints, storageDisks []Sto
 	endpointStrings := make([]string, len(endpoints))
 	// Initialize the erasure sets instance.
 	s := &erasureSets{
-		sets:               make([]*erasureObjects, setCount),
-		erasureDisks:       make([][]StorageAPI, setCount),
-		erasureLockers:     make([][]dsync.NetLocker, setCount),
-		endpoints:          endpoints,
-		endpointStrings:    endpointStrings,
-		setCount:           setCount,
-		drivesPerSet:       drivesPerSet,
-		format:             format,
-		disksConnectEvent:  make(chan diskConnectInfo),
+		sets:               make([]*erasureObjects, setCount), 	// 一个 EC 组对应一个 erasureObjects
+		erasureDisks:       make([][]StorageAPI, setCount), 	// xlstorage 对象或者 xlstorageClient 对象
+		erasureLockers:     make([][]dsync.NetLocker, setCount),// 分布式锁，二维数据与 Disk 一一对应	
+		endpoints:          endpoints,			// 所有节点的 host:dir
+		endpointStrings:    endpointStrings, 	// 每个磁盘的 diskPath
+		setCount:           setCount, 			// ec 分组数量
+		drivesPerSet:       drivesPerSet, 		// 每组 EC 的分块数量
+		format:             format, 			// 当前 zone 中选了一个 disk 的 format，但是 This 被设置了 “”，应该是内部数据对于初始化有用
+		disksConnectEvent:  make(chan diskConnectInfo), 	// disk 重连之后会将在 sets 中的索引传入管都，后面会在 mrfOperations 中到对应写入失败的分块数据进行 headl
 		disksConnectDoneCh: make(chan struct{}),
-		distributionAlgo:   format.Erasure.DistributionAlgo,
-		deploymentID:       uuid.MustParse(format.ID),
+		distributionAlgo:   format.Erasure.DistributionAlgo, // 分区算法，是一种 hash
+		deploymentID:       uuid.MustParse(format.ID), 		 // 选择的format 的 ID，所有的 disk 的 都一样 
 		pool:               NewMergeWalkPool(globalMergeLookupTimeout),
 		poolSplunk:         NewMergeWalkPool(globalMergeLookupTimeout),
 		poolVersions:       NewMergeWalkVersionsPool(globalMergeLookupTimeout),
-		mrfOperations:      make(map[healSource]int),
+		mrfOperations:      make(map[healSource]int), 	// 记录写入或者删除 整体操作成功，但是部分 EC 分块失败的信息
 	}
 
 	mutex := newNSLock(globalIsDistErasure)
 
 	// Initialize byte pool once for all sets, bpool size is set to
 	// setCount * drivesPerSet with each memory upto blockSizeV1.
+	/*
+	 * blockSizeV1 = 10 * 1024
+	 */
 	bp := bpool.NewBytePoolCap(setCount*drivesPerSet, blockSizeV1, blockSizeV1*2)
 
 	for i := 0; i < setCount; i++ {
@@ -330,6 +336,9 @@ func newErasureSets(ctx context.Context, endpoints Endpoints, storageDisks []Sto
 			if disk == nil {
 				continue
 			}
+			/*
+			 * format.Erasure.This 赋值给 xlstorage 的 diskID，然后返回
+			 */
 			diskID, derr := disk.GetDiskID()
 			if derr != nil {
 				disk.Close()
@@ -356,6 +365,14 @@ func newErasureSets(ctx context.Context, endpoints Endpoints, storageDisks []Sto
 	}
 
 	// Start the disk monitoring and connect routine.
+	/*
+	 * defaultMonitorConnectEndpointInterval = 10 s
+	 * monitorAndConnectEndpoints : 内部对所有的 disk 发送心跳，内部逻辑应该是还没有实现完全，目前在本地直接返回 true
+	 * 
+	 * maintainMRFList : erasureObjects 的 mrfOpCh 将写入失败的数据传入，在 set 内委会一个 10000 的队列记录，用于后面待 disk 恢复之后进行 heal
+	 *
+	 * healMRFRoutine : 待磁盘恢复之后，每个 100ms 从全局的队列（mrfOperations 长度 10000） 先出该磁盘的数据，然后进行 heal
+	 */
 	go s.monitorAndConnectEndpoints(ctx, defaultMonitorConnectEndpointInterval)
 	go s.maintainMRFList()
 	go s.healMRFRoutine()
@@ -1689,6 +1706,7 @@ func (s *erasureSets) healMRFRoutine() {
 		time.Sleep(time.Second)
 	}
 
+	/**/
 	for e := range s.disksConnectEvent {
 		// Get the list of objects related the er.set
 		// to which the connected disk belongs.

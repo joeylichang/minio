@@ -65,6 +65,48 @@ func newErasureZones(ctx context.Context, endpointZones EndpointZones) (ObjectLa
 				localDrives = append(localDrives, endpoint.Path)
 			}
 		}
+		/*
+		 * 初始化创建的目录，作为元数据存储
+		 * /diskpath
+		 * 		|__/.minio.sys
+		 * 				|__/format.json
+		 * 				|__/tmp
+		 * 				|__/multipart
+		 * 				|__/buckets
+		 *
+		 * 内部很多逻辑，是加载和分布式加载 qurom 的校验逻辑，还有版本升级等，在这里这些一下结论
+		 *
+		 * storageDisks 分为两种类型
+		 * 	1. 本地磁盘，直接生成 xlstorage 对象对本地进行操作
+		 * 	2. 远程磁盘，生成 xlstorageClient 对远程进行操作（两者接口完全一样）
+		 * 	3. 结论：操作的文件可能在本地也可能在远程，但是内存中的数据是全量的包括本地和远程的，包括 formats
+		 * 
+		 * formats 是关于 deplomentId、EC 相关的元数据
+		 * 	1. 只有 local == true 时才进行初始化操作（起源都是加载），既第一个节点进行加载并且实现初始化落地到本地磁盘上
+		 * 	2. formatErasureV3 解析，目前 V3 是最新的版本信息
+		 * 		type formatErasureV3 struct {
+		 *			formatMetaV1
+		 *			Erasure struct {
+		 *				Version string `json:"version"` 	= "3"
+		 *				This    string `json:"this"`   		= 随机 ID，
+		 *				Sets [][]string `json:"sets"`		= len(一维) = 分几组EC，len(二维) = 每组EC的分块数量，内容是节点的随机 ID
+		 *				DistributionAlgo string `json:"distributionAlgo"` "SIPMOD"
+		 * 			} `json:"xl"`
+		 *		}
+		 * 		
+		 * 		type formatMetaV1 struct {
+		 *			Version string `json:"version"` 	= "1"
+		 *			Format string `json:"format"` 		= "xl"
+		 *			ID string `json:"id"` 				= 随机 ID
+		 *		}
+		 * 	上述内容除了随机 ID 都是固定值
+		 *  formatErasureV3.Erasure.This = 对应formatErasureV3.Erasure.Sets 位置的 UUID
+		 * 	如果指定的了 deploymentID（环境变量） ，则赋值给 formatErasureV3.formatMetaV1.ID，否则随机值
+		 * 	formatErasureV3.formatMetaV1.ID 会赋值给 goableDeploymentId
+		 *
+		 * 注意：内部生成了 formats 数组，然后会在各自的磁盘上持久化（本地和远程）
+		 * 		返回的 formats[i] 是通过一定的算法选一个元素 clone 出来，其中 This 变量设置为“”，应该是内部的其他数据对于后面的初始化有用
+		 */
 		storageDisks[i], formats[i], err = waitForFormatErasure(local, ep.Endpoints, i+1,
 			ep.SetCount, ep.DrivesPerSet, deploymentID)
 		if err != nil {
@@ -291,6 +333,10 @@ func (z *erasureZones) CrawlAndGetDataUsage(ctx context.Context, bf *bloomFilter
 	for _, z := range z.zones {
 		for _, erObj := range z.sets {
 			// Add new buckets.
+			/*
+			 * set 中随机选了一个磁盘，获取全部 bucket 信息
+			 * 所以，不会有重复
+			 */
 			buckets, err := erObj.ListBuckets(ctx)
 			if err != nil {
 				return err
@@ -303,6 +349,9 @@ func (z *erasureZones) CrawlAndGetDataUsage(ctx context.Context, bf *bloomFilter
 				knownBuckets[b.Name] = struct{}{}
 			}
 			wg.Add(1)
+			/*
+			 * 一个set 一个result
+			 */
 			results = append(results, dataUsageCache{})
 			go func(i int, erObj *erasureObjects) {
 				updates := make(chan dataUsageCache, 1)
@@ -536,6 +585,15 @@ func (z *erasureZones) GetObjectInfo(ctx context.Context, bucket, object string,
 }
 
 // PutObject - writes an object to least used erasure zone.
+/*
+ * 1. 全局锁
+ * 2. 选择 zone 
+ * 	遍历左右的zone，查找是否有之前对象所在的zone，没有则选择新的
+ * 	选择新 zone，考虑容量，引入一定的随机性
+ * 3. 选择 Set （hash）
+ * 4. 写 disk，先写 xl.meta 在写数据，前者不需要 编码
+ * 	先写到临时目录，在mv 到正式目录
+ */
 func (z *erasureZones) PutObject(ctx context.Context, bucket string, object string, data *PutObjReader, opts ObjectOptions) (ObjectInfo, error) {
 	// Lock the object.
 	lk := z.NewNSLock(ctx, bucket, object)

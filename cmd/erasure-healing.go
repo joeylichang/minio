@@ -28,6 +28,10 @@ import (
 	"github.com/minio/minio/pkg/sync/errgroup"
 )
 
+/*
+ * bucket / object 两个级别的 heal
+ */
+
 func (er erasureObjects) ReloadFormat(ctx context.Context, dryRun bool) error {
 	logger.LogIf(ctx, NotImplemented{})
 	return NotImplemented{}
@@ -58,6 +62,13 @@ func (er erasureObjects) HealBucket(ctx context.Context, bucket string, dryRun, 
 }
 
 // Heal bucket - create buckets on disks where it does not exist.
+/*
+ * 作用：检查  bucket 目录是否存在（volume），只针对 errVolumeNotFound 错误进行处理（磁盘正常只是 bucket 路径不再）
+ * 逻辑：
+ * 	1. 向所有的 disk 发送 StatVol 请求
+ * 		1.1 errDiskNotFound -> DriveStateOffline, errVolumeNotFound->DriveStateMissing, 其他-> DriveStateCorrupt, 磁盘在本地为 nil -> DriveStateOffline
+ * 	2. 向所有的报 DriveStateMissing 错误的磁盘发起 MakeVol 请求。
+ */
 func healBucket(ctx context.Context, storageDisks []StorageAPI, storageEndpoints []string, bucket string, writeQuorum int,
 	dryRun bool) (res madmin.HealResultItem, err error) {
 
@@ -114,7 +125,7 @@ func healBucket(ctx context.Context, storageDisks []StorageAPI, storageEndpoints
 
 	// Initialize heal result info
 	res = madmin.HealResultItem{
-		Type:      madmin.HealItemBucket,
+		Type:      madmin.HealItemBucket, 	// "bucket"
 		Bucket:    bucket,
 		DiskCount: len(storageDisks),
 	}
@@ -164,6 +175,9 @@ func healBucket(ctx context.Context, storageDisks []StorageAPI, storageEndpoints
 
 // listAllBuckets lists all buckets from all disks. It also
 // returns the occurrence of each buckets in all disks
+/*
+ * 指定 disks 所有的 bucket 的 name、最后修改时间
+ */
 func listAllBuckets(storageDisks []StorageAPI, healBuckets map[string]VolInfo) (err error) {
 	for _, disk := range storageDisks {
 		if disk == nil {
@@ -223,6 +237,18 @@ func shouldHealObjectOnDisk(erErr, dataErr error, meta FileInfo, quorumModTime t
 }
 
 // Heals an object by re-writing corrupt/missing erasure blocks.
+/* 参数：
+ * 	partsMetadata：所有disk 上面的 xl.meta 数据
+ * 	errs：list xl.meta 返回的错误信息
+ * 	latestFileInfo：最新的 xl.meta （并且在所有的disk 上超过半数）
+ * 	其他：透传参数
+ * 作用：
+ * 	通过编码恢复新的数据
+ * 逻辑：
+ * 	1. 获取数据最新的 disk
+ * 	2. 对获取的disk 进行校验（分两种模式）
+ *  3. 对数据进行编码复原
+ */
 func (er erasureObjects) healObject(ctx context.Context, bucket string, object string,
 	partsMetadata []FileInfo, errs []error, latestFileInfo FileInfo,
 	dryRun bool, remove bool, scanMode madmin.HealScanMode) (result madmin.HealResultItem, err error) {
@@ -234,9 +260,18 @@ func (er erasureObjects) healObject(ctx context.Context, bucket string, object s
 
 	// List of disks having latest version of the object er.meta
 	// (by modtime).
+	/*
+	 * 返回最新版本（修改时间是最新，也是绝大多数）的disk，被称作 online disk
+	 */
 	latestDisks, modTime := listOnlineDisks(storageDisks, partsMetadata, errs)
 
 	// List of disks having all parts as per latest er.meta.
+	/*
+	 * 在所有的 最新的 disk 上（latestDisks） 进行检测
+	 * 如果参数传：
+	 * 	HealDeepScan -> bitrot 数据内容级别检测
+	 * 	HealNormalScan -> 检查 part 文件是否存在
+	 */
 	availableDisks, dataErrs := disksWithAllParts(ctx, latestDisks, partsMetadata, errs, bucket, object, scanMode)
 
 	// Initialize heal result object
@@ -378,6 +413,9 @@ func (er erasureObjects) healObject(ctx context.Context, bucket string, object s
 		result.ParityBlocks = latestMeta.Erasure.ParityBlocks
 
 		// Reorder so that we have data disks first and parity disks next.
+		/*
+		 * 根据 latestMeta.Erasure.Distribution 索引的数据，重排 availableDisks、outDatedDisks、partsMetadata
+		 */
 		latestDisks = shuffleDisks(availableDisks, latestMeta.Erasure.Distribution)
 		outDatedDisks = shuffleDisks(outDatedDisks, latestMeta.Erasure.Distribution)
 		partsMetadata = shufflePartsMetadata(partsMetadata, latestMeta.Erasure.Distribution)
@@ -493,13 +531,25 @@ func (er erasureObjects) healObject(ctx context.Context, bucket string, object s
 
 // healObjectDir - heals object directory specifically, this special call
 // is needed since we do not have a special backend format for directories.
+/*
+ * 1. 向所有的磁盘发送 ListDir 请求，查看 diskpath/volume(bucket)/object/ 对应 bucket object 目录下的项
+ * 	1.1 如果是空，返回 nil
+ * 	1.2 如果目录下面的项多余 1个，则返回 errVolumeNotEmpty
+ * 	1.3 其他错误，照常返回
+ * 2. 如果是悬空对象（errVolumeNotFound + errFileNotFound 多余其他返回值），且 !dryRun && remove ，则删除上述 object 的目录
+ * 3. 如果是 设置了 dryRun ，或者 danglingObject（悬空对象），直接返回
+ * 	3.1 dryRun 应该是指运行统计一下，但是不做任何操作的含义
+ * 4. 如果是 errVolumeNotFound + errFileNotFound 错误，则 mkdir diskpath/volume(bucket)/object/
+ *
+ * 作用：非悬空对象，没有设置 dryRun，恢复 object 只是创建了 object 对应的目录
+ */
 func (er erasureObjects) healObjectDir(ctx context.Context, bucket, object string, dryRun bool, remove bool) (hr madmin.HealResultItem, err error) {
 	storageDisks := er.getDisks()
-	storageEndpoints := er.getEndpoints()
+	storageEndpoints := er.getEndpoints() 
 
 	// Initialize heal result object
 	hr = madmin.HealResultItem{
-		Type:         madmin.HealItemObject,
+		Type:         madmin.HealItemObject, 	// "object"
 		Bucket:       bucket,
 		Object:       object,
 		DiskCount:    len(storageDisks),
@@ -511,7 +561,16 @@ func (er erasureObjects) healObjectDir(ctx context.Context, bucket, object strin
 	hr.Before.Drives = make([]madmin.HealDriveInfo, len(storageDisks))
 	hr.After.Drives = make([]madmin.HealDriveInfo, len(storageDisks))
 
+	/*
+	 * diskpath/volume(bucket)/object/
+	 * 为空，返回 nil
+	 * 有内容，返回 errVolumeNotEmpty
+	 */
 	errs := statAllDirs(ctx, storageDisks, bucket, object)
+	/*
+	 * 未发现文件 或者 volume 的错误占比超过一半，则认为是悬空dir
+	 * 应该是删除未完全
+	 */
 	danglingObject := isObjectDirDangling(errs)
 	if danglingObject {
 		if !dryRun && remove {
@@ -633,6 +692,9 @@ func defaultHealResult(latestFileInfo FileInfo, storageDisks []StorageAPI, stora
 }
 
 // Stat all directories.
+/*
+ * diskpath/volume(bucket)/object
+ */
 func statAllDirs(ctx context.Context, storageDisks []StorageAPI, bucket, prefix string) []error {
 	g := errgroup.WithNErrs(len(storageDisks))
 	for index, disk := range storageDisks {
@@ -658,6 +720,9 @@ func statAllDirs(ctx context.Context, storageDisks []StorageAPI, bucket, prefix 
 // ObjectDir is considered dangling/corrupted if any only
 // if total disks - a combination of corrupted and missing
 // files is lesser than N/2+1 number of disks.
+/*
+ * 未发现文件 或者 volume 的错误占比超过一半，则认为是悬空dir
+ */
 func isObjectDirDangling(errs []error) (ok bool) {
 	var found int
 	var notFound int
@@ -680,6 +745,9 @@ func isObjectDirDangling(errs []error) (ok bool) {
 // Object is considered dangling/corrupted if any only
 // if total disks - a combination of corrupted and missing
 // files is lesser than number of data blocks.
+/*
+ * 返回 object 的 xl.meta 的信息，和 object 是否损坏（无法恢复）
+ */
 func isObjectDangling(metaArr []FileInfo, errs []error, dataErrs []error) (validMeta FileInfo, ok bool) {
 	// We can consider an object data not reliable
 	// when er.meta is not found in read quorum disks.
@@ -727,6 +795,15 @@ func isObjectDangling(metaArr []FileInfo, errs []error, dataErrs []error) (valid
 }
 
 // HealObject - heal the given object, automatically deletes the object if stale/corrupted if `remove` is true.
+/*
+ * 逻辑：
+ * 1. 如果 object 参数有 "/" 说明是路径，则恢复路径，既 mkdir bucket/object 
+ * 2. 读取 bucket/object/xl.meta 文件内容，用其判断是否是悬空对象（多余一般的分片有问题，无法恢复），进行删除（根据参数决定）
+ * 3. 获取全部磁盘上 bucket/object/xl.meta 上的最后修改时间（来自客户端）
+ * 	3.1 如果最新的修改时间少于一般，则故障，此时返回 err
+ * 	3.2 如果返回的结果全部是错误，则删除对象（根据传入参数）
+ * 4. 到此，少于一半磁盘获取最后修改时间有问题，此时进行 对象修复
+ */
 func (er erasureObjects) HealObject(ctx context.Context, bucket, object, versionID string, opts madmin.HealOpts) (hr madmin.HealResultItem, err error) {
 	// Create context that also contains information about the object and bucket.
 	// The top level handler might not have this information.
@@ -740,6 +817,9 @@ func (er erasureObjects) HealObject(ctx context.Context, bucket, object, version
 	healCtx := logger.SetReqInfo(GlobalContext, newReqInfo)
 
 	// Healing directories handle it separately.
+	/*
+	 * object 参数包含 "/" 则仅仅修复 object 目录
+	 */
 	if HasSuffix(object, SlashSeparator) {
 		return er.healObjectDir(healCtx, bucket, object, opts.DryRun, opts.Remove)
 	}
@@ -748,10 +828,18 @@ func (er erasureObjects) HealObject(ctx context.Context, bucket, object, version
 	storageEndpoints := er.getEndpoints()
 
 	// Read metadata files from all the disks
+	/*
+	 * /diskpath/bucket/object/xl.meta
+	 * 读取其中的元数据，并且校验 文件头部的 versionid 是否与 versionID 一致，否则返回 error
+	 */
 	partsMetadata, errs := readAllFileInfo(healCtx, storageDisks, bucket, object, versionID)
 
 	// Check if the object is dangling, if yes and user requested
 	// remove we simply delete it from namespace.
+	/*
+	 * 返回 object 的 xl.meta 的信息，和 object 是否损坏（无法恢复）
+	 * 如果已经损坏，且 Remove 为 true，DryRun 为false（不仅仅是查看，而需要运行），则删除 object
+	 */
 	if m, ok := isObjectDangling(partsMetadata, errs, []error{}); ok {
 		writeQuorum := m.Erasure.DataBlocks + 1
 		if m.Erasure.DataBlocks == 0 {
@@ -768,6 +856,10 @@ func (er erasureObjects) HealObject(ctx context.Context, bucket, object, version
 		return defaultHealResult(FileInfo{}, storageDisks, storageEndpoints, errs, bucket, object), toObjectErr(err, bucket, object)
 	}
 
+	/*
+	 * 1. 获取 xl.meta 的最后修改时间（来自客户端）
+	 * 2. 如果来自最新的更改时间的磁盘上的 xl.meta 数量对于一半，则返货这个 xl.meta 数据
+	 */
 	latestFileInfo, err := getLatestFileInfo(healCtx, partsMetadata, errs)
 	if err != nil {
 		return defaultHealResult(FileInfo{}, storageDisks, storageEndpoints, errs, bucket, object), toObjectErr(err, bucket, object)
@@ -780,6 +872,9 @@ func (er erasureObjects) HealObject(ctx context.Context, bucket, object, version
 		}
 	}
 
+	/*
+	 * 返回来全部错误，如果是悬空对象（无法恢复，少于一般的数据 part 故障），删除对象
+	 */
 	if errCount == len(errs) {
 		// Only if we get errors from all the disks we return error. Else we need to
 		// continue to return filled madmin.HealResultItem struct which includes info

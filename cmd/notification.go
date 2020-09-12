@@ -40,14 +40,30 @@ import (
 	"github.com/willf/bloom"
 )
 
+/*
+ * NotificationSys 主要作用有三个：
+ * 1. 向集群内其他节点发送消息，进行一些权限类的操作
+ * 2. bucket 的通知机制的实现
+ * 3. 诊断的接口（应该是 admin 看一些统计信息使用的）
+ *
+ * 注意： reload format.json 是比较特属的逻辑
+ */
+
 // NotificationSys - notification system.
 type NotificationSys struct {
 	sync.RWMutex
+	/*
+	 * bucket 维度事件的通知，bucket_handlers 内部对 bucket put、delete等操作最后都会查看是否有关注该时间有的话会send
+	 */
 	targetList                 *event.TargetList
 	targetResCh                chan event.TargetIDResult
 	bucketRulesMap             map[string]event.RulesMap
 	bucketRemoteTargetRulesMap map[string]map[event.TargetID]event.RulesMap
-	peerClients                []*peerRESTClient
+	/* 
+	 * 与其他节点交互的客户端，长度是 EndpointZones 中的 Host（去重）
+ 	 * 既，以节点为粒度进行交互的，
+ 	 */
+	peerClients                []*peerRESTClient 
 }
 
 // GetARNList - returns available ARNs.
@@ -136,6 +152,16 @@ func (g *NotificationGroup) Go(ctx context.Context, f func() error, index int, a
 }
 
 // ReloadFormat - calls ReloadFormat REST call on all peers.
+/*
+ * 1. NotificationSys.peerClients 是节点为单位的，既 向一个节点发送请求，内部是哪个zone、哪个set 并不关心
+ * 2. peerRESTServer 接收到请求之后，透传给 zone 的接口
+ * 3. erasureZones 内部抢占分布式锁，资源是 .minio.sys、formattte.json，只有一台机器能抢到锁进行操作
+ * 4. erasureZones 遍历所有的 erasureSets
+ * 5. erasureSets 初始化所有的 Disk（本地是xlstorage，远程是客户端），然后重新加载
+ * 		/diskpath/.minio.sys/format.json（参数解析中生成的）
+ * 6. 内存中更新新的 format.json 数据
+ * 7. 断开磁盘之间的心跳 ，然后重新连接
+ */
 func (sys *NotificationSys) ReloadFormat(dryRun bool) []NotificationPeerErr {
 	ng := WithNPeers(len(sys.peerClients))
 	for idx, client := range sys.peerClients {
@@ -542,6 +568,9 @@ func (sys *NotificationSys) GetLocks(ctx context.Context) []*PeerLocks {
 }
 
 // LoadBucketMetadata - calls LoadBucketMetadata call on all peers
+/*
+ * 加载 bucket 的 metadata，然后放入全局变量 globalBucketMetadataSys
+ */
 func (sys *NotificationSys) LoadBucketMetadata(ctx context.Context, bucketName string) {
 	ng := WithNPeers(len(sys.peerClients))
 	for idx, client := range sys.peerClients {
@@ -595,10 +624,18 @@ func (sys *NotificationSys) AddRemoteTarget(bucketName string, target event.Targ
 		targetMap = make(map[event.TargetID]event.RulesMap)
 	}
 
+	/*
+	 * bucketRemoteTargetRulesMap
+	 * <bucketName, <target.ID, rulesMap>>
+	 */
 	rulesMap = rulesMap.Clone()
 	targetMap[target.ID()] = rulesMap
 	sys.bucketRemoteTargetRulesMap[bucketName] = targetMap
 
+	/*
+	 * bucketRulesMap
+	 * <bucketName, rulesMap>
+	 */
 	rulesMap = rulesMap.Clone()
 	rulesMap.Add(sys.bucketRulesMap[bucketName])
 	sys.bucketRulesMap[bucketName] = rulesMap
@@ -761,6 +798,9 @@ func (sys *NotificationSys) Send(args eventArgs) {
 		return
 	}
 
+	/*
+	 * 结果会在 targetResCh 中返回，有失败的话会打印日志，在 Init 有go 一个协程来处理这个
+	 */
 	sys.targetList.Send(args.ToEvent(true), targetIDSet, sys.targetResCh)
 }
 

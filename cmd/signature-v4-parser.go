@@ -48,6 +48,9 @@ func (c credentialHeader) getScope() string {
 }
 
 func getReqAccessKeyV4(r *http.Request, region string, stype serviceType) (auth.Credentials, bool, APIErrorCode) {
+	/*
+	 * 从 Header 获取签名信息中
+	 */
 	ch, err := parseCredentialHeader("Credential="+r.URL.Query().Get("X-Amz-Credential"), region, stype)
 	if err != ErrNone {
 		// Strip off the Algorithm prefix.

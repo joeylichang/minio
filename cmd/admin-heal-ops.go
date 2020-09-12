@@ -72,6 +72,13 @@ var (
 // healSequenceStatus - accumulated status of the heal sequence
 type healSequenceStatus struct {
 	// summary and detail for failures
+	/*
+	 * Summary:
+	 * 	healNotStartedStatus  = "not started"
+	 *	healRunningStatus     = "running"
+	 *	healStoppedStatus     = "stopped"
+	 *	healFinishedStatus
+	 */
 	Summary       healStatusSummary `json:"Summary"`
 	FailureDetail string            `json:"Detail,omitempty"`
 	StartTime     time.Time         `json:"StartTime"`
@@ -83,6 +90,13 @@ type healSequenceStatus struct {
 	Items []madmin.HealResultItem `json:"Items"`
 }
 
+/*
+ * allHealState
+ * 维护 path 与 healSequence（heal 逻辑） 的map 映射
+ * 	1.周期任务（5min），遍历所有的 healSequence 检查其是否结束，并且结束了 10min 以上
+ * 	 	是的话则删除对应的 healSequence
+ * 	2. HealSequence 的控制、信息获取
+ */
 // structure to hold state of all heal sequences in server memory
 type allHealState struct {
 	sync.Mutex
@@ -107,10 +121,15 @@ func (ahs *allHealState) periodicHealSeqsClean(ctx context.Context) {
 	// it ends) from the global state after timeout has elapsed.
 	for {
 		select {
+		/* 5 min */
 		case <-time.After(time.Minute * 5):
 			now := UTCNow()
 			ahs.Lock()
 			for path, h := range ahs.healSeqMap {
+				/*
+				 * keepHealSeqStateDuration = 10 min
+				 * hasEnded(): 没有数据，或者任务结束、停止
+				 */
 				if h.hasEnded() && h.endTime.Add(keepHealSeqStateDuration).Before(now) {
 					delete(ahs.healSeqMap, path)
 				}
@@ -146,6 +165,11 @@ func (ahs *allHealState) getHealSequence(path string) (h *healSequence, exists b
 	return h, exists
 }
 
+/*
+ * 1. 调用 HealSequence 的 stop()
+ * 2. 1s 循环一次等待 HealSequence 执行完完任务或者 stop 成功
+ * 3. 返回 madmin.HealStopSuccess json序列化
+ */
 func (ahs *allHealState) stopHealSequence(path string) ([]byte, APIError) {
 	var hsp madmin.HealStopSuccess
 	he, exists := ahs.getHealSequence(path)
@@ -190,6 +214,14 @@ func (ahs *allHealState) stopHealSequence(path string) ([]byte, APIError) {
 // `keepHealSeqStateDuration`. This function also launches a
 // background routine to clean up heal results after the
 // aforementioned duration.
+/*
+ * 作用：添加一个 healSequence 到 allHealState
+ * 	1. 如果 h.forceStarted == true 停止当前 bucket/object 的任务
+ * 	2. 否则, 查看 bucket/object 任务是否存在，如果存在直接返回 err，否则继续
+ * 	3. 查看是否有 bucket/object 为前缀，或者 bucket/object 部分内容为前缀的任务，有则返回err
+ * 		注意：这是为啥嘞？
+ * 	4. 添加到 map 中，然后调用 hSeq的 healSequenceStart
+ */
 func (ahs *allHealState) LaunchNewHealSequence(h *healSequence) (
 	respBytes []byte, apiErr APIError, errMsg string) {
 
@@ -348,6 +380,11 @@ type healSequence struct {
 	lastSentResultIndex int64
 
 	// Number of total items scanned against item type
+	/*
+	 * 每种类型scan的计数，无论成功失败
+	 * 类型分为：bucket、object、meta
+	 * 仅在 sourceCh 模式下进行统计
+	 */
 	scannedItemsMap map[madmin.HealItemType]int64
 
 	// Number of total items healed against item type
@@ -357,6 +394,10 @@ type healSequence struct {
 	healFailedItemsMap map[string]int64
 
 	// The time of the last scan/heal activity
+	/*
+	 * 每完成一个 heal 任务之后更新一下时间
+	 *  仅在 sourceCh 模式下更新
+	 */
 	lastHealActivity time.Time
 
 	// Holds the request-info for logging
@@ -568,6 +609,66 @@ func (h *healSequence) pushHealResultItem(r madmin.HealResultItem) error {
 // routine for completion, and (2) listens for external stop
 // signals. When either event happens, it sets the finish status for
 // the heal-sequence.
+/*
+ * Heal 任务调度流程开始的地方：
+ * 	1. Heal 任务的来源有两个，一个是 sourceCh 管道，另一个是遍历（修复结果通过 traverseAndHealDoneCh 管道返回）
+ *	2. 两种模式都会被封装成任务，调用 queueHealTask 加入任务中
+ *  注意：两种模式不能兼用 
+ * 
+ * 1. healFromSourceCh
+ * 	1.1 从 sourceCh 管道接收到的任务，调用 queueHealTask 加入队列
+ * 2. traverseAndHeal
+ * 	2.1 healDiskMeta
+ * 		2.1.1 healDiskFormat
+ *			queueHealTask(healSource{bucket: SlashSeparator}, madmin.HealItemMetadata)
+ * 		2.1.2 healMinioSysMeta(config)
+ * 			HealObjects + queueHealTask
+ * 		2.1.3 healMinioSysMeta(buckets)
+ * 			HealObjects + queueHealTask
+ * 	2.2 healBuckets
+ * 		2.2.1 healBucket
+ * 			2.2.1.1 healObject
+ * 				queueHealTask
+ * 			2.2.2.2 objectAPI.HealObjects
+ * 
+ * 下面看一下 HealObjects 和 queueHealTask 的逻辑，然后针对各种情况是如何 heal 的
+ * 	1. HealObjects
+ * 		1.1 遍历 zone、set，递归查看指定目录比较文件，及修改时间（必须都是最新的）
+ *		1.2 完全正常的，并且是 HealNormalScan（opt参数） 模式时，则跳过
+ *		1.3 否则调用 指定的回调函数（queueHealTask）
+ * 		1.4 在 queueHealTask 内部数据 objAPI.HealObject 逻辑
+ * 		1.5 objAPI.HealFormat 仅仅是修复 /diskpath/.minio.sys/format.json
+ * 		注意：需要扫描的两个路径
+ * 			 /diskpath/.minio.sys/config  
+ *		     /diskpath/.minio.sys/buckets
+ * 	2. queueHealTask
+ * 		2.2 healDiskFormat 
+ * 			2.2.1 objAPI.HealFormat 
+ * 				2.2.1.1 获取 /diskpath/.minio.sys/format.json 全局锁
+ * 				2.2.2.2 遍历 zone，Set 内部 读取全部的 format.json 数据
+ * 				2.2.2.3 根据 format.json 数据集，重新生成新的全量 format.json 集合
+ * 				2.2.2.4 因为读出来的数据集合有缺失（某些磁盘没有、过期），然后重新写入
+ * 			2.3.1 globalNotificationSys.ReloadForma
+ * 					所有的 meta 修复之后，都需要重新 reload 到内存
+ * 		2.3 objAPI.HealBucket
+ * 			2.3.1 没有加全局锁
+ * 			2.3.2 遍历所有的 zone、set（没有对应 bucket 返回err）
+ * 			2.3.3 检查  bucket 目录是否存在（volume），只针对 errVolumeNotFound 错误进行处理（磁盘正常只是 bucket 路径不再）
+ * 				2.3.3.1. 向所有的 disk 发送 StatVol 请求
+ * 					errDiskNotFound -> DriveStateOffline, errVolumeNotFound->DriveStateMissing, 其他-> DriveStateCorrupt, 磁盘在本地为 nil -> DriveStateOffline
+ * 				2.3.3.2 向所有的报 DriveStateMissing 错误的磁盘发起 MakeVol 请求
+ *		2.4 objAPI.HealObject
+ * 			2.4.1 获取 /diskpath/${bucket}/${object} 全局读锁
+ * 				注意：读锁 与 meta 修复不一致，meta 是写锁
+ * 			2.4.2 遍历 zone、set 没有对应 object 返回err）
+ * 			2.4.3 如果 object 参数有 "/" 说明是路径，则恢复路径，既 mkdir bucket/object
+ * 			2.4.4 读取 bucket/object/xl.meta 文件内容，用其判断是否是悬空对象（多余一般的分片有问题，无法恢复），进行删除（根据参数决定）
+ * 			2.4.5 获取全部磁盘上 bucket/object/xl.meta 上的最后修改时间（来自客户端）
+ * 				如果最新的修改时间少于一般，则故障，此时返回 err
+ * 				如果返回的结果全部是错误，则删除对象（根据传入参数）
+ * 			2.4.6 EC 编码恢复数据，写入disk
+ * 
+ */
 func (h *healSequence) healSequenceStart() {
 	// Set status as running
 	h.mutex.Lock()
@@ -768,6 +869,14 @@ func (h *healSequence) healMinioSysMeta(metaPrefix string) func() error {
 		// NOTE: Healing on meta is run regardless
 		// of any bucket being selected, this is to ensure that
 		// meta are always upto date and correct.
+		/*
+		 * /diskpath/.minio.sys/config
+		 * /diskpath/.minio.sys/buckets
+		 *
+		 * 遍历 zone、set，递归查看指定目录（参数是上面两个）比对上述两个，比较文件，及修改时间（必须都是最新的）
+		 * 完全正常的，并且是 HealNormalScan（opt参数） 模式时，则跳过
+		 * 否则调用 指定的回调函数
+		 */
 		return objectAPI.HealObjects(h.ctx, minioMetaBucket, metaPrefix, h.settings, func(bucket, object, versionID string) error {
 			if h.isQuitting() {
 				return errHealStopSignalled

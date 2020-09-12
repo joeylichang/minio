@@ -197,11 +197,11 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 type ZoneEndpoints struct {
 	SetCount     int 		// 所有的目录分成几组
 	DrivesPerSet int 		// 纠删码的分块数量，既一组分成几块
-	Endpoints    Endpoints 	// 所有的目录
+	Endpoints    Endpoints 	// 所有的目录，内部是数组（所有的目录连续排列在一起，没有进行EC分组）
 }
 
 // EndpointZones - list of list of endpoints
-type EndpointZones []ZoneEndpoints
+type EndpointZones []ZoneEndpoints 	// 一个元素表示一个 zone 
 
 // Add add zone endpoints
 func (l *EndpointZones) Add(zeps ZoneEndpoints) error {

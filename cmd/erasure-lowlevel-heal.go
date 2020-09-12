@@ -25,6 +25,9 @@ import (
 
 // Heal heals the shard files on non-nil writers. Note that the quorum passed is 1
 // as healing should continue even if it has been successful healing only one shard file.
+/*
+ * erasure-healing 修复 Object 内部调用，主要就是 EC 编码的逻辑
+ */
 func (e Erasure) Heal(ctx context.Context, readers []io.ReaderAt, writers []io.Writer, size int64) error {
 	r, w := io.Pipe()
 	go func() {

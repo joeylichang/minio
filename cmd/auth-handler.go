@@ -282,10 +282,30 @@ func checkRequestAuthType(ctx context.Context, r *http.Request, action policy.Ac
 // Additionally returns the accessKey used in the request, and if this request is by an admin.
 func checkRequestAuthTypeToAccessKey(ctx context.Context, r *http.Request, action policy.Action, bucketName, objectName string) (accessKey string, owner bool, s3Err APIErrorCode) {
 	var cred auth.Credentials
+
+	/*
+	* const (
+	* 	authTypeUnknown authType = iota
+	* 	authTypeAnonymous
+	* 	authTypePresigned
+	* 	authTypePresignedV2
+	* 	authTypePostPolicy
+	* 	authTypeStreamingSigned
+	* 	authTypeSigned
+	* 	authTypeSignedV2
+	* 	authTypeJWT
+	* 	authTypeSTS
+	* )
+	*
+	* getRequestAuthType 从请求的参数中解析出 AuthType
+	*/
 	switch getRequestAuthType(r) {
 	case authTypeUnknown, authTypeStreamingSigned:
 		return accessKey, owner, ErrSignatureVersionNotSupported
 	case authTypePresignedV2, authTypeSignedV2:
+		/*
+		 * 判断签名是否匹配 ，针对 PresignedV2 和 SignedV2
+		 */
 		if s3Err = isReqAuthenticatedV2(r); s3Err != ErrNone {
 			return accessKey, owner, s3Err
 		}
@@ -296,6 +316,9 @@ func checkRequestAuthTypeToAccessKey(ctx context.Context, r *http.Request, actio
 		case policy.GetBucketLocationAction, policy.ListAllMyBucketsAction:
 			region = ""
 		}
+		/*
+		 * 验证是否匹配 AWS V4 签名
+		 */
 		if s3Err = isReqAuthenticated(ctx, r, region, serviceS3); s3Err != ErrNone {
 			return accessKey, owner, s3Err
 		}
@@ -313,6 +336,9 @@ func checkRequestAuthTypeToAccessKey(ctx context.Context, r *http.Request, actio
 
 	// LocationConstraint is valid only for CreateBucketAction.
 	var locationConstraint string
+	/*
+	 * 针对 CreateBucketAction 操作，从请求中解析出 bucket 的地域信息
+	 */
 	if action == policy.CreateBucketAction {
 		// To extract region from XML in request body, get copy of request body.
 		payload, err := ioutil.ReadAll(io.LimitReader(r.Body, maxLocationConstraintSize))
@@ -335,6 +361,9 @@ func checkRequestAuthTypeToAccessKey(ctx context.Context, r *http.Request, actio
 	}
 
 	if cred.AccessKey == "" {
+		/*
+		 * 根据 policy 配置，判断是否具备相应的权限
+		 */
 		if globalPolicySys.IsAllowed(policy.Args{
 			AccountName:     cred.AccessKey,
 			Action:          action,
@@ -348,6 +377,9 @@ func checkRequestAuthTypeToAccessKey(ctx context.Context, r *http.Request, actio
 		}
 		return cred.AccessKey, owner, ErrAccessDenied
 	}
+	/*
+	 * 根据 IAM 配置，判断是否具备相应的权限
+	 */
 	if globalIAMSys.IsAllowed(iampolicy.Args{
 		AccountName:     cred.AccessKey,
 		Action:          iampolicy.Action(action),
@@ -590,6 +622,11 @@ func isPutActionAllowed(atype authType, bucketName, objectName string, r *http.R
 		cred, owner, s3Err = getReqAccessKeyV2(r)
 	case authTypeStreamingSigned, authTypePresigned, authTypeSigned:
 		region := globalServerRegion
+		/*
+		 * 从请求头中获取 accessKey，如果和 global 中的不同，则从 IAM 中获取 凭证（cred）
+		 * global 应该就是 root user ，否则应该是其分配的角色，在 IAM 中
+		 * 如果是 root user ，则 owner = true， 否则为 false
+		 */
 		cred, owner, s3Err = getReqAccessKeyV4(r, region, serviceS3)
 	}
 	if s3Err != ErrNone {
@@ -604,12 +641,20 @@ func isPutActionAllowed(atype authType, bucketName, objectName string, r *http.R
 	// Do not check for PutObjectRetentionAction permission,
 	// if mode and retain until date are not set.
 	// Can happen when bucket has default lock config set
+	/*
+	 * 如果是 对象锁 的操作，需要有下面两个字段
+	 * "X-Amz-Object-Lock-Mode"/"X-Amz-Object-Lock-Retain-Until-Date"
+	 */
 	if action == iampolicy.PutObjectRetentionAction &&
 		r.Header.Get(xhttp.AmzObjectLockMode) == "" &&
 		r.Header.Get(xhttp.AmzObjectLockRetainUntilDate) == "" {
 		return ErrNone
 	}
 
+	/*
+	 * 如果从上面获取的凭证（cred）中 accessKey 为空，说明…… 什么呢？超级用户？
+	 * 查看资源权限控制，是否可以进行相应的操作，是否满足相应的约束
+	 */
 	if cred.AccessKey == "" {
 		if globalPolicySys.IsAllowed(policy.Args{
 			AccountName:     cred.AccessKey,
@@ -624,6 +669,10 @@ func isPutActionAllowed(atype authType, bucketName, objectName string, r *http.R
 		return ErrAccessDenied
 	}
 
+	/*
+	 * 如果从上面获取的凭证（cred）中 accessKey 不为空
+	 * 则查看用户权限，是否可以进行相应的操作
+	 */
 	if globalIAMSys.IsAllowed(iampolicy.Args{
 		AccountName:     cred.AccessKey,
 		Action:          action,

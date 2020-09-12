@@ -32,6 +32,7 @@ const (
 	envDataUsageCrawlDebug = "MINIO_DISK_USAGE_CRAWL_DEBUG"
 
 	dataUsageRoot   = SlashSeparator
+	/* .minio.sys/buckets */
 	dataUsageBucket = minioMetaBucket + SlashSeparator + bucketMetaPrefix
 
 	dataUsageObjName   = ".usage.json"
@@ -54,6 +55,9 @@ func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, gui <-chan
 			continue
 		}
 
+		/* 
+		 * /diskpath/.minio.sys/buckets/.usage.json
+		 */
 		_, err = objAPI.PutObject(ctx, dataUsageBucket, dataUsageObjName, NewPutObjReader(r, nil, nil), ObjectOptions{})
 		if !isErrBucketNotFound(err) {
 			logger.LogIf(ctx, err)
